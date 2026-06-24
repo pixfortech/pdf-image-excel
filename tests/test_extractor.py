@@ -71,3 +71,47 @@ def test_repeated_header_is_ignored():
 def test_auto_group_label_detection():
     cands = parser.detect_group_label_candidates([SAMPLE_PAGE_1])
     assert any("Customer Name" == c for c in cands)
+
+
+def test_smart_parse_switches_when_tables_lose_groups():
+    # Simulate a PDF whose group labels sit OUTSIDE the tables: the detected
+    # table has clean rows but no "Customer Name: ..." marker, while the page
+    # text does contain the markers.
+    tables = [{
+        "page": 1,
+        "rows": [
+            ["Inv No", "Inv Date", "Total Amount", "Returns"],
+            ["A1", "15/05/2026", "630.00", "0.00"],
+            ["A2", "15/05/2026", "12,705.00", "0.00"],
+        ],
+        "ocr_confidence": None,
+    }]
+    # Table mode alone finds rows but zero groups.
+    table_only = parser.parse_tables(tables, group_label="Customer Name")
+    assert len(parser.list_detected_groups(table_only)) == 0
+
+    records, mode_used, switched = parser.smart_parse(
+        tables, [SAMPLE_PAGE_1], group_label="Customer Name", preferred="tables"
+    )
+    assert switched is True
+    assert mode_used == "text"
+    assert "ALPHA STORE" in parser.list_detected_groups(records)
+
+
+def test_smart_parse_keeps_tables_when_groups_present():
+    # When the table rows themselves carry the group marker, no switch happens.
+    tables = [{
+        "page": 1,
+        "rows": [
+            ["Customer Name: ALPHA STORE"],
+            ["Inv No", "Inv Date", "Amount"],
+            ["A1", "15/05/2026", "630.00"],
+        ],
+        "ocr_confidence": None,
+    }]
+    records, mode_used, switched = parser.smart_parse(
+        tables, ["irrelevant text"], group_label="Customer Name", preferred="tables"
+    )
+    assert switched is False
+    assert mode_used == "tables"
+    assert "ALPHA STORE" in parser.list_detected_groups(records)

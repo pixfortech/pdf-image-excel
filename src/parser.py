@@ -278,6 +278,43 @@ def _extract_line_fields(line, compiled, field_names) -> Optional[Dict[str, str]
 # Helpers for the UI
 # ---------------------------------------------------------------------------
 
+def smart_parse(
+    tables: Sequence[dict],
+    pages_text: Sequence[str],
+    *,
+    group_label: str = "",
+    preferred: str = "tables",
+    row_regex: Optional[str] = None,
+    total_tokens: Optional[Sequence[str]] = None,
+):
+    """Parse with the preferred strategy, auto-switching when it loses groups.
+
+    Returns ``(records, mode_used, switched)``.
+
+    ``preferred`` is ``"tables"``, ``"text"`` or ``"regex"``.  When the table
+    strategy yields rows but **zero** groups (a common case where group labels
+    such as ``Customer Name: ...`` sit *outside* the detected tables) and parsing
+    the page text *does* recover groups, this transparently falls back to
+    text-line parsing and reports ``switched=True`` so the UI can warn the user.
+    """
+    if preferred == "regex" and row_regex:
+        recs = parse_text_lines(pages_text, group_label=group_label,
+                                row_regex=row_regex, total_tokens=total_tokens)
+        return recs, "regex", False
+
+    if preferred == "tables" and tables:
+        recs = parse_tables(tables, group_label=group_label, total_tokens=total_tokens)
+        if not list_detected_groups(recs):
+            text_recs = parse_text_lines(pages_text, group_label=group_label,
+                                         total_tokens=total_tokens)
+            if list_detected_groups(text_recs):
+                return text_recs, "text", True
+        return recs, "tables", False
+
+    recs = parse_text_lines(pages_text, group_label=group_label, total_tokens=total_tokens)
+    return recs, "text", False
+
+
 def list_detected_groups(records: Sequence[Record]) -> List[str]:
     """Return unique detected group names in order of first appearance."""
     seen: List[str] = []

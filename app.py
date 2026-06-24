@@ -287,19 +287,37 @@ elif page == PAGES[1]:
             )
 
         if st.button("🔍 Parse rows", type="primary"):
-            if approach.startswith("Detected tables") and result.tables:
-                records = parser.parse_tables(result.tables, group_label=CFG.source.group_label)
+            if approach.startswith("Detected tables"):
+                preferred = "tables"
             elif approach == "Custom regex" and regex:
-                records = parser.parse_text_lines(
-                    result.pages_text, group_label=CFG.source.group_label, row_regex=regex
-                )
+                preferred = "regex"
             else:
-                records = parser.parse_text_lines(
-                    result.pages_text, group_label=CFG.source.group_label
-                )
+                preferred = "text"
+            # Auto-switches tables->text when table mode parses rows but finds 0
+            # groups (group labels sitting outside the tables).
+            records, mode_used, switched = parser.smart_parse(
+                result.tables, result.pages_text,
+                group_label=CFG.source.group_label,
+                preferred=preferred, row_regex=regex,
+            )
             st.session_state["records"] = records
             st.session_state["records_df"] = records_to_df(records)
-            st.success(f"Parsed {len(records)} rows. Detected groups: {len(parser.list_detected_groups(records))}.")
+            n_groups = len(parser.list_detected_groups(records))
+
+            if switched:
+                st.warning(
+                    "⚠️ Detected-tables mode parsed rows but found **0 groups** — "
+                    "the group labels are outside the tables in this PDF. "
+                    f"Automatically switched to **Text lines** mode, which found "
+                    f"**{n_groups} group(s)**. (You can re-parse with another mode above.)"
+                )
+            elif mode_used == "tables" and n_groups == 0:
+                st.error(
+                    "⚠️ Detected-tables mode parsed rows but found **0 groups**, and no "
+                    "group markers were found in the page text either. Check the "
+                    "**group label** above (page 2) or try **Text lines** / **Custom regex** mode."
+                )
+            st.success(f"Parsed {len(records)} rows. Detected groups: {n_groups}.")
 
         df = st.session_state["records_df"]
         if df is not None:
