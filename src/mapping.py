@@ -72,6 +72,9 @@ class SourceMapping:
 
     # Parsing rules (configurable, not hardcoded).
     date_formats: List[str] = field(default_factory=list)
+    # Date interpretation for ambiguous numeric dates: "dmy" (Indian/British,
+    # DEFAULT), "mdy" (US), or "auto".
+    date_interpretation: str = "dmy"
     decimal_sep: str = "."
     thousands_sep: str = ","
     currency_chars: str = "₹$€£¥"

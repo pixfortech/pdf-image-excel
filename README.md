@@ -93,6 +93,33 @@ On **page 3 (Source Field Mapping)** choose which detected field is the:
 …and set parsing rules (thousands/decimal separators, currency symbols, date
 formats) and whether to **sum duplicate dates**.
 
+### Date handling (format-independent matching)
+
+The app never depends on one fixed date pattern. PDF dates and Excel dates are
+each parsed from many representations and **normalised to a plain date**
+(`YYYY-MM-DD`) before matching, so different formats still match:
+
+* PDF text: `15/05/2026`, `15-05-2026`, `15.05.2026`, `15 May 2026`,
+  `15-May-2026`, `2026-05-15`, `15/05/26`.
+* Excel cells: real date objects, datetimes, text dates, `DD/MM/YYYY`,
+  `DD-MM-YYYY`, `YYYY-MM-DD`, `DD MMM YYYY`, **Excel serial numbers**, and
+  values like `2026-05-15 00:00:00`.
+
+A **Date interpretation** setting disambiguates numeric dates like `05/06/2026`:
+
+* **Indian / British — DD/MM/YYYY (default)** → 5 June 2026
+* **US — MM/DD/YYYY** → 6 May 2026… i.e. May 6
+* **Auto-detect**
+
+If the selected Excel date column matches few PDF dates, page 7 shows a date
+analysis (selected column, first parsed Excel dates, PDF date range, matched /
+missing counts, and **suggested alternative date columns**). If more than 25% of
+PDF dates are missing, a **strong warning** explains the likely cause (wrong date
+column, wrong worksheet, wrong workbook year, or missing rows).
+
+Missing dates are **never inserted silently** — the default action is **skip**;
+rows are inserted/copied only if you explicitly choose that behaviour on page 6.
+
 ## 7. Map Excel sheets and columns
 
 First, on **page 5 (Group → Sheet Mapping)** assign each detected Customer Name
@@ -202,7 +229,10 @@ with commas stripped from formulas), appending multiple missing dates to
 distinct rows, and the **Excel mapping-pattern** workflow (copying one
 worksheet's column pattern to many mapped sheets, per-sheet overrides, and
 verifying each Customer Name writes to its own assigned sheet rather than the
-template sheet).
+template sheet), and **format-independent date handling** (DD/MM/YYYY,
+DD-MM-YYYY, YYYY-MM-DD, datetimes, Excel serial dates, text and two-digit-year
+dates all normalised; Indian/British default interpretation; rejecting non-date
+text like `wise`/`Date:`; the strong warning when most dates are missing).
 
 ---
 
@@ -232,7 +262,7 @@ pdf-image-excel/
   tests/
     test_extractor.py  test_parser.py  test_mapping.py
     test_aggregator.py test_excel_writer.py test_excel_mapping.py
-    test_formula.py    test_end_to_end.py
+    test_formula.py    test_dates.py     test_end_to_end.py
   scripts/
     real_file_validation.py   end-to-end harness (generates real PDF + .xlsx,
                               or accepts your real file paths as arguments)

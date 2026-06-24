@@ -168,6 +168,10 @@ def parse_tables(
                 idx += 1
                 continue
 
+            # Skip rows before the first group marker when a group is expected.
+            if group_label and not active_group:
+                continue
+
             rec = _make_record(page, active_group, header, cells, joined, conf, idx)
             records.append(rec)
             idx += 1
@@ -233,6 +237,12 @@ def parse_text_lines(
                 )
                 records.append(rec)
                 idx += 1
+                continue
+
+            # Ignore any "preamble" lines that appear before the first group
+            # marker (report title, From Date / To Date, etc.) when a group
+            # label is expected.  These must not enter the write plan.
+            if group_label and not active_group:
                 continue
 
             fields = _extract_line_fields(line, compiled, field_names)

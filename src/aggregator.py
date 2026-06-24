@@ -72,7 +72,8 @@ def aggregate(
             continue
         group = rec.group or _get_field(rec, source.group_field)
         date_raw = _get_field(rec, source.date_field)
-        date_val = utils.parse_date(date_raw, formats=formats)
+        date_val = utils.parse_date(date_raw, formats=formats,
+                                    interpretation=source.date_interpretation)
         amount_raw = _get_field(rec, source.amount_field)
         amount = utils.parse_amount(
             amount_raw,

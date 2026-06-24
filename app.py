@@ -374,6 +374,21 @@ elif page == PAGES[2]:
         )
         CFG.source.date_formats = [f.strip() for f in fmts.split(",") if f.strip()]
 
+        _INTERP_LABELS = {
+            "dmy": "Indian / British — DD/MM/YYYY (default)",
+            "mdy": "US — MM/DD/YYYY",
+            "auto": "Auto-detect",
+        }
+        interp_opts = ["dmy", "mdy", "auto"]
+        cur = CFG.source.date_interpretation if CFG.source.date_interpretation in interp_opts else "dmy"
+        CFG.source.date_interpretation = st.radio(
+            "Date interpretation (for ambiguous dates like 05/06/2026)",
+            interp_opts, index=interp_opts.index(cur),
+            format_func=lambda v: _INTERP_LABELS[v], horizontal=True,
+        )
+        st.caption("Both PDF and Excel dates are normalised to a plain date (YYYY-MM-DD) "
+                   "before matching, so mixed formats still match.")
+
         if CFG.source.date_field and CFG.source.amount_field:
             st.success("Source mapping looks complete. Continue to Excel mapping.")
         else:
@@ -630,28 +645,66 @@ elif page == PAGES[6]:
             )
 
         st.subheader("Validation summary")
-        cols = st.columns(5)
+        cols = st.columns(6)
         cols[0].metric("Ready", report.ready_count)
         cols[1].metric("Unmapped groups", len(report.unmapped_groups))
         cols[2].metric("Dates not found", report.dates_not_found)
         cols[3].metric("Missing columns", report.missing_columns)
         cols[4].metric("Conflicts", report.conflicts)
+        cols[5].metric("Skipped (invalid)", report.skipped_invalid)
 
+        # Strong warning when most PDF dates were not found in a sheet.
+        for w in report.date_match_warnings:
+            st.error("⚠️ " + w)
         if report.unmapped_groups:
             st.warning("Unmapped groups: " + ", ".join(report.unmapped_groups))
         if report.duplicate_headers:
             for sh, d in report.duplicate_headers.items():
                 st.warning(f"Sheet '{sh}' has duplicate headers: {', '.join(d)}")
 
+        # Date-column analysis / suggestions (per mapped sheet).
+        with st.expander("🔎 Date matching analysis (selected column, samples, suggestions)"):
+            interp = CFG.source.date_interpretation
+            pdf_dates = sorted({it.date for it in report.items if it.date})
+            if pdf_dates:
+                st.caption(f"PDF date range: {pdf_dates[0]} → {pdf_dates[-1]} "
+                           f"({len(pdf_dates)} distinct dates). Interpretation: {interp}.")
+            for sheet in dict.fromkeys(CFG.group_to_sheet.values()):
+                sm = CFG.sheets.get(sheet)
+                if not sheet or sm is None or sheet not in excel_reader.list_sheets(wb):
+                    continue
+                date_col = excel_reader.resolve_column_index(
+                    wb, sheet, mode=sm.date_target_mode.value, selector=sm.date_column, header_row=sm.header_row)
+                st.markdown(f"**{sheet}** — selected date column: `{sm.date_column}`")
+                if date_col is None:
+                    st.write("Date column could not be resolved.")
+                    continue
+                info = excel_reader.analyze_date_column(
+                    wb, sheet, date_col, set(pdf_dates), header_row=sm.header_row,
+                    date_formats=sm.date_formats or None, interpretation=interp)
+                st.write(f"Matched {info['matched']} / {info['total_targets']} PDF dates "
+                         f"({info['missing']} missing). First parsed Excel dates:")
+                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["sample"]])
+                sugg = excel_reader.suggest_date_columns(
+                    wb, sheet, set(pdf_dates), header_row=sm.header_row,
+                    date_formats=sm.date_formats or None, interpretation=interp)
+                if sugg:
+                    st.write("Suggested date columns (by match count): "
+                             + ", ".join(f"{l} ({h or 'no header'}): {m} matched" for l, h, m, _ in sugg))
+
         write_mode = CFG.write_rules.output_type.value
         st.subheader(f"Write plan (exactly what will happen) — write mode: {write_mode}")
-        st.caption("All three value forms are shown. Only 'Value to write' lands in the cell.")
+        st.caption("Both original and normalised dates are shown so you can tell a "
+                   "format issue from a missing-date issue. Only 'Value to write' lands in the cell.")
         plan_rows = []
         for it in report.items:
             plan_rows.append({
                 "Customer Name": it.group,
                 "Worksheet": it.sheet,
-                "Date": it.date_raw,
+                "PDF date (original)": it.date_raw,
+                "PDF date (normalised)": it.pdf_date_normalised,
+                "Excel date (original)": it.excel_date_value,
+                "Excel date (normalised)": it.excel_date_normalised,
                 "Source rows": len(it.source_records),
                 "Invoice breakup": it.invoice_breakup,
                 "Numeric total": it.aggregated_amount,
@@ -662,7 +715,7 @@ elif page == PAGES[6]:
                 "Existing value": it.existing_value,
                 "Value to write": it.final_value,
                 "Write mode": write_mode,
-                "Status": it.status,
+                "Match status": it.status,
                 "Messages": "; ".join(it.messages),
             })
         st.dataframe(pd.DataFrame(plan_rows), use_container_width=True)

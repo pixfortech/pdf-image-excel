@@ -99,38 +99,80 @@ def format_amount(value: Optional[float], decimals: int = 2) -> str:
 # Date parsing
 # ---------------------------------------------------------------------------
 
-# A broad, configurable set of date formats.  The user can extend this through
-# the mapping configuration; we never assume one particular format.
-DEFAULT_DATE_FORMATS: Sequence[str] = (
-    "%d/%m/%Y",
-    "%d-%m-%Y",
-    "%d.%m.%Y",
-    "%Y-%m-%d",
-    "%Y/%m/%d",
-    "%m/%d/%Y",
-    "%m-%d-%Y",
-    "%d/%m/%y",
-    "%d-%m-%y",
-    "%d %b %Y",
-    "%d %B %Y",
-    "%b %d, %Y",
-    "%B %d, %Y",
-    "%d-%b-%Y",
-    "%d-%b-%y",
+# Date-interpretation modes used to disambiguate numeric dates like 05/06/2026.
+DMY = "dmy"   # Indian / British: day first (DEFAULT)
+MDY = "mdy"   # US: month first
+AUTO = "auto"  # auto-detect from the components
+DATE_INTERPRETATIONS = (DMY, MDY, AUTO)
+
+# Unambiguous formats tried first regardless of interpretation.
+_ISO_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d")
+_NAMED_FORMATS = (
+    "%d %b %Y", "%d %B %Y", "%d-%b-%Y", "%d-%B-%Y", "%d %b %y", "%d-%b-%y",
+    "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y",
 )
+# Day-first (Indian/British) numeric formats.
+_DMY_FORMATS = (
+    "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
+)
+# Month-first (US) numeric formats.
+_MDY_FORMATS = (
+    "%m/%d/%Y", "%m-%d-%Y", "%m.%d.%Y", "%m/%d/%y", "%m-%d-%y", "%m.%d.%y",
+)
+
+# Kept for backwards compatibility; a broad day-first-leaning set.
+DEFAULT_DATE_FORMATS: Sequence[str] = _ISO_FORMATS + _NAMED_FORMATS + _DMY_FORMATS + _MDY_FORMATS
+
+# Excel serial-date epoch (openpyxl/Excel "1900 system"; day 0 = 1899-12-30).
+_EXCEL_EPOCH = _dt.date(1899, 12, 30)
+# Only treat bare numbers in this range as Excel serial dates (≈ 1954-08-05 to
+# ≈ 3543), so a stray year like 2026 or a small count is not misread as a date.
+_SERIAL_MIN, _SERIAL_MAX = 20000, 600000
+
+
+def _formats_for(interpretation: str) -> tuple:
+    """Ordered format list for an interpretation (unambiguous first)."""
+    interp = (interpretation or DMY).lower()
+    if interp == MDY:
+        return _ISO_FORMATS + _NAMED_FORMATS + _MDY_FORMATS + _DMY_FORMATS
+    # DMY (default) and AUTO both lean day-first for the strptime pass; AUTO then
+    # also runs the numeric heuristic below.
+    return _ISO_FORMATS + _NAMED_FORMATS + _DMY_FORMATS + _MDY_FORMATS
+
+
+def excel_serial_to_date(value) -> Optional[_dt.date]:
+    """Convert an Excel serial date number to a ``date`` (or ``None``)."""
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    if not (_SERIAL_MIN <= value <= _SERIAL_MAX):
+        return None
+    try:
+        return _EXCEL_EPOCH + _dt.timedelta(days=int(round(value)))
+    except (OverflowError, ValueError):
+        return None
 
 
 def parse_date(
     value,
     *,
     formats: Optional[Iterable[str]] = None,
-    dayfirst: bool = True,
+    interpretation: str = DMY,
+    allow_serial: bool = True,
+    dayfirst: Optional[bool] = None,
 ) -> Optional[_dt.date]:
-    """Parse a date from many possible representations.
+    """Parse a date from many representations and normalise to a ``date``.
 
-    Accepts real ``date``/``datetime`` objects (as produced by openpyxl for
-    real Excel dates) as well as text in any of the supplied ``formats``.
-    Returns ``None`` when nothing matches.
+    Handles real ``date``/``datetime`` objects (as produced by openpyxl for real
+    Excel dates), Excel serial-date numbers, and text in many formats (DD/MM/YYYY,
+    DD-MM-YYYY, DD.MM.YYYY, YYYY-MM-DD, ``15 May 2026``, ``15-May-2026``,
+    two-digit years, datetime strings like ``2026-05-15 00:00:00``).
+
+    ``interpretation`` (``dmy``/``mdy``/``auto``) disambiguates numeric dates such
+    as ``05/06/2026``.  The default is ``dmy`` (Indian/British → 5 June 2026).
+    ``formats`` (if given) are tried first as an explicit user hint.  Always
+    returns a date with no time component, or ``None`` when nothing matches.
     """
     if value is None:
         return None
@@ -139,24 +181,46 @@ def parse_date(
     if isinstance(value, _dt.date):
         return value
 
+    # Excel serial date numbers (when a date cell isn't formatted as a date).
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if allow_serial:
+            return excel_serial_to_date(value)
+        return None
+
+    # ``dayfirst`` retained for backwards compatibility.
+    if dayfirst is False and interpretation == DMY:
+        interpretation = MDY
+
     text = str(value).strip()
     if not text:
         return None
+    # Drop a trailing time component, e.g. "2026-05-15 00:00:00" -> "2026-05-15".
+    text_nodate_time = re.sub(r"[ T]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?$", "", text).strip()
 
-    fmts = list(formats) if formats else list(DEFAULT_DATE_FORMATS)
-    for fmt in fmts:
-        try:
-            return _dt.datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
+    candidates = []
+    if formats:
+        candidates.extend(formats)
+    candidates.extend(_formats_for(interpretation))
 
-    # Last resort: pull a date-looking token out of a longer string and retry
-    # with a numeric heuristic that respects ``dayfirst``.
+    for source in (text_nodate_time, text):
+        for fmt in candidates:
+            try:
+                return _dt.datetime.strptime(source, fmt).date()
+            except ValueError:
+                continue
+
+    # Numeric heuristic for anything left (and the primary path for AUTO).
     match = re.search(r"(\d{1,4})[/\-.](\d{1,2})[/\-.](\d{1,4})", text)
     if match:
         a, b, c = (int(g) for g in match.groups())
-        return _heuristic_numeric_date(a, b, c, dayfirst=dayfirst)
+        df = (interpretation != MDY)
+        return _heuristic_numeric_date(a, b, c, dayfirst=df)
     return None
+
+
+def normalise_date(value, **kwargs) -> Optional[_dt.date]:
+    """Alias for :func:`parse_date` emphasising normalisation to a bare date."""
+    return parse_date(value, **kwargs)
 
 
 def _heuristic_numeric_date(a: int, b: int, c: int, *, dayfirst: bool) -> Optional[_dt.date]:

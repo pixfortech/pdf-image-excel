@@ -34,6 +34,10 @@ class Status:
     DATE_NOT_FOUND = "Date Not Found"
     CONFLICT = "Conflict"
     ERROR = "Error"
+    INVALID_ROW = "Skipped (no valid date/amount)"
+
+# Fraction of PDF dates that may be missing before a strong warning is shown.
+DATE_MISS_WARN_THRESHOLD = 0.25
 
 
 @dataclass
@@ -63,6 +67,10 @@ class PlanItem:
     is_append: bool = False          # appended below existing data (no physical row insert)
     template_row: Optional[int] = None
     date_column: Optional[int] = None  # resolved date column index (for inserts)
+    # Date transparency (for the final preview):
+    pdf_date_normalised: str = ""      # e.g. "2026-05-15"
+    excel_date_value: object = None    # original Excel cell value at the matched row
+    excel_date_normalised: str = ""    # normalised Excel date
 
 
 @dataclass
@@ -73,7 +81,9 @@ class ValidationReport:
     missing_columns: int = 0
     conflicts: int = 0
     errors: int = 0
+    skipped_invalid: int = 0          # rows lacking a valid date AND amount
     duplicate_headers: Dict[str, List[str]] = field(default_factory=dict)
+    date_match_warnings: List[str] = field(default_factory=list)
 
     @property
     def has_blocking_errors(self) -> bool:
@@ -191,12 +201,18 @@ def build_plan(
     # Per-sheet cursor so that multiple missing dates appended to the same sheet
     # land on distinct, sequential rows instead of all colliding at max_row+1.
     append_cursor: Dict[str, int] = {}
+    interp = config.source.date_interpretation or "dmy"
+    # Track, per sheet, the set of PDF dates and how many matched (for the
+    # >25%-missing warning and the date-column suggestions).
+    per_sheet_targets: Dict[str, set] = {}
+    per_sheet_missing: Dict[str, int] = {}
 
     for agg in rows:
         item = PlanItem(
             group=agg.group,
             date=agg.date,
             date_raw=agg.date_raw,
+            pdf_date_normalised=agg.date.isoformat() if agg.date else "",
             source_amounts=[r.get(config.source.amount_field, "") for r in agg.source_records]
             if config.source.amount_field else [],
             aggregated_amount=agg.amount,
@@ -206,6 +222,23 @@ def build_plan(
             source_records=agg.source_records,
         )
         item.messages.extend(agg.warnings)
+
+        # A row must have BOTH a valid (normalised) date and a valid amount to
+        # enter the write plan.  This filters parser noise such as a title or
+        # "From Date:" line that slipped through with text like "wise"/"sales".
+        has_valid_date = agg.date is not None
+        has_valid_amount = bool(agg.source_amount_values)
+        if not has_valid_date or not has_valid_amount:
+            item.status = Status.INVALID_ROW
+            why = []
+            if not has_valid_date:
+                why.append(f"no valid date (got {agg.date_raw!r})")
+            if not has_valid_amount:
+                why.append("no valid amount")
+            item.messages.append("Row skipped: " + "; ".join(why))
+            report.skipped_invalid += 1
+            report.items.append(item)
+            continue
 
         sheet = config.group_to_sheet.get(agg.group, "")
         if not sheet:
@@ -281,7 +314,13 @@ def build_plan(
                 wb, sheet, date_col, agg.date,
                 header_row=sm.header_row,
                 date_formats=sm.date_formats or None,
+                interpretation=interp,
             ) if date_col else None
+
+            # Track match statistics per sheet (for the >25%-missing warning).
+            per_sheet_targets.setdefault(sheet, set()).add(agg.date)
+            if matched is None:
+                per_sheet_missing[sheet] = per_sheet_missing.get(sheet, 0) + 1
 
             item.date_column = date_col
             if matched is None:
@@ -307,15 +346,26 @@ def build_plan(
                     item.template_row = excel_reader.nearest_date_row(
                         wb, sheet, date_col, agg.date,
                         header_row=sm.header_row, date_formats=sm.date_formats or None,
+                        interpretation=interp,
                     )
                 else:
                     item.status = Status.DATE_NOT_FOUND
-                    item.messages.append("Matching date row not found in worksheet.")
+                    item.messages.append(
+                        "Matching date row not found in worksheet "
+                        f"(PDF date {item.pdf_date_normalised})."
+                    )
                     report.dates_not_found += 1
                     report.items.append(item)
                     continue
             else:
                 item.matched_row = matched
+                # Record the Excel date cell value + its normalised form.
+                if date_col:
+                    raw_excel = wb[sheet].cell(row=matched, column=date_col).value
+                    item.excel_date_value = raw_excel
+                    norm = utils.parse_date(raw_excel, formats=sm.date_formats or None,
+                                            interpretation=interp)
+                    item.excel_date_normalised = norm.isoformat() if norm else ""
             item.target_cell = f"{item.target_column_letter}{item.matched_row}"
 
         # Resolve optional return column.
@@ -355,6 +405,31 @@ def build_plan(
             item.status = Status.READY
 
         report.items.append(item)
+
+    # Strong warning when most PDF dates are missing from a sheet's date column.
+    for sheet, targets in per_sheet_targets.items():
+        total = len(targets)
+        missing = per_sheet_missing.get(sheet, 0)
+        if total and (missing / total) > DATE_MISS_WARN_THRESHOLD:
+            sm = config.sheets.get(sheet)
+            suggestions = []
+            if sm is not None:
+                try:
+                    suggestions = excel_reader.suggest_date_columns(
+                        wb, sheet, targets, header_row=sm.header_row,
+                        date_formats=sm.date_formats or None, interpretation=interp)
+                except Exception:
+                    suggestions = []
+            sug_txt = ""
+            better = [s for s in suggestions if s[2] > (total - missing)]
+            if better:
+                sug_txt = " Suggested date column(s): " + ", ".join(
+                    f"{letter} ({hdr or 'no header'}) matches {m}" for letter, hdr, m, _ in better)
+            report.date_match_warnings.append(
+                f"Sheet '{sheet}': {missing} of {total} PDF dates were not found in the "
+                f"selected date column. This may mean the wrong date column, wrong worksheet, "
+                f"wrong workbook year, or missing date rows.{sug_txt}"
+            )
 
     return report
 

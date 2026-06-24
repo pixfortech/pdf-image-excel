@@ -128,10 +128,12 @@ def find_row_by_date(
     *,
     header_row: int = 1,
     date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
 ) -> Optional[int]:
     """Find the 1-based row whose date column matches ``target_date``.
 
-    Handles real date objects, datetimes, and text dates in many formats.
+    Handles real date objects, datetimes, Excel serial numbers and text dates in
+    many formats; everything is normalised to a bare ``date`` before comparing.
     Returns ``None`` if no row matches.
     """
     if target_date is None or date_col_index is None:
@@ -139,7 +141,7 @@ def find_row_by_date(
     ws = wb[sheet_name]
     for r in range(header_row + 1, ws.max_row + 1):
         val = ws.cell(row=r, column=date_col_index).value
-        parsed = utils.parse_date(val, formats=date_formats)
+        parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
         if parsed is not None and parsed == target_date:
             return r
     return None
@@ -153,6 +155,7 @@ def nearest_date_row(
     *,
     header_row: int = 1,
     date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
 ) -> Optional[int]:
     """Return the row whose date is closest to ``target_date`` (for templating)."""
     if target_date is None or date_col_index is None:
@@ -162,7 +165,7 @@ def nearest_date_row(
     best_delta = None
     for r in range(header_row + 1, ws.max_row + 1):
         val = ws.cell(row=r, column=date_col_index).value
-        parsed = utils.parse_date(val, formats=date_formats)
+        parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
         if parsed is None:
             continue
         delta = abs((parsed - target_date).days)
@@ -170,3 +173,103 @@ def nearest_date_row(
             best_delta = delta
             best_row = r
     return best_row
+
+
+def column_dates(
+    wb,
+    sheet_name: str,
+    col_index: int,
+    *,
+    header_row: int = 1,
+    date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
+    limit: Optional[int] = None,
+):
+    """Return ``(row, raw_value, parsed_date)`` for cells in a column that parse
+    as dates.  Used for previews and date-column suggestions."""
+    ws = wb[sheet_name]
+    out = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        val = ws.cell(row=r, column=col_index).value
+        parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
+        if parsed is not None:
+            out.append((r, val, parsed))
+            if limit and len(out) >= limit:
+                break
+    return out
+
+
+def analyze_date_column(
+    wb,
+    sheet_name: str,
+    col_index: int,
+    target_dates,
+    *,
+    header_row: int = 1,
+    date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
+) -> dict:
+    """Summarise how well a column's dates cover ``target_dates`` (a set of dates).
+
+    Returns matched/missing counts, the parseable-date count, and the first few
+    parsed dates for display.
+    """
+    targets = set(d for d in target_dates if d is not None)
+    found = set()
+    parsed_count = 0
+    sample = []
+    ws = wb[sheet_name]
+    for r in range(header_row + 1, ws.max_row + 1):
+        val = ws.cell(row=r, column=col_index).value
+        parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
+        if parsed is None:
+            continue
+        parsed_count += 1
+        if len(sample) < 10:
+            sample.append((val, parsed))
+        if parsed in targets:
+            found.add(parsed)
+    matched = len(found)
+    missing = len(targets) - matched
+    return {
+        "col_index": col_index,
+        "parsed_count": parsed_count,
+        "matched": matched,
+        "missing": missing,
+        "total_targets": len(targets),
+        "sample": sample,
+    }
+
+
+def suggest_date_columns(
+    wb,
+    sheet_name: str,
+    target_dates,
+    *,
+    header_row: int = 1,
+    date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
+    top: int = 3,
+):
+    """Scan every column and return those that best match ``target_dates``.
+
+    Returns a list of ``(column_letter, header_text, matched_count, parsed_count)``
+    sorted by match count (then by parseable-date count), best first.
+    """
+    ws = wb[sheet_name]
+    results = []
+    for c in range(1, ws.max_column + 1):
+        info = analyze_date_column(
+            wb, sheet_name, c, target_dates,
+            header_row=header_row, date_formats=date_formats, interpretation=interpretation)
+        if info["parsed_count"] == 0:
+            continue
+        header = ws.cell(row=header_row, column=c).value
+        results.append((
+            get_column_letter(c),
+            "" if header is None else str(header),
+            info["matched"],
+            info["parsed_count"],
+        ))
+    results.sort(key=lambda t: (t[2], t[3]), reverse=True)
+    return results[:top]
