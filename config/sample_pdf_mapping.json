@@ -1,0 +1,16 @@
+{
+  "_comment": "Example ONLY. All field names below are placeholders that must be replaced by the field keys detected in YOUR uploaded PDF and chosen in the UI. Nothing here is hardcoded into the app.",
+  "group_label": "<the label text the PDF uses to introduce a group, e.g. a name field>",
+  "group_field": "<detected field that holds the group/customer/branch/party/account>",
+  "date_field": "<detected field that holds the row date>",
+  "amount_field": "<detected field that holds the main amount>",
+  "return_field": "<optional detected field for returns/deductions, or empty>",
+  "ignored_fields": ["<any detected fields to ignore>"],
+  "sum_duplicate_dates": true,
+  "keep_invoice_breakup": true,
+  "output_type": "numeric",
+  "date_formats": ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"],
+  "decimal_sep": ".",
+  "thousands_sep": ",",
+  "currency_chars": "₹$€£¥"
+}

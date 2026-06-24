@@ -1,0 +1,22 @@
+{
+  "_comment": "Example ONLY. Worksheet names, columns and cells below are placeholders chosen by the user in the UI. The app does not hardcode any of these. Selection can be by header_name, column_letter, or cell_reference.",
+  "group_to_sheet": {
+    "<a detected group name from your PDF>": "<the worksheet you assign it to>",
+    "<another detected group name>": "<another worksheet>"
+  },
+  "sheets": {
+    "<a worksheet name in your Excel file>": {
+      "sheet_name": "<same worksheet name>",
+      "header_row": 1,
+      "date_target_mode": "header_name",
+      "date_column": "<the header text or column letter that holds dates>",
+      "amount_target_mode": "column_letter",
+      "amount_column": "<header text, column letter, or cell ref for the amount target>",
+      "amount_cell": "",
+      "return_target_mode": "header_name",
+      "return_column": "",
+      "return_cell": "",
+      "date_formats": ["%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"]
+    }
+  }
+}

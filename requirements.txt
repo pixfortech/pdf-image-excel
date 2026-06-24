@@ -1,0 +1,20 @@
+# Core app
+streamlit>=1.30
+pandas>=2.0
+openpyxl>=3.1
+
+# PDF extraction
+pdfplumber>=0.10
+PyMuPDF>=1.23
+
+# OCR (optional but recommended for scanned PDFs / images)
+pytesseract>=0.3.10
+Pillow>=10.0
+# EasyOCR is an optional heavier alternative to pytesseract.
+# easyocr>=1.7
+
+# Fetching Excel from a downloadable link
+requests>=2.31
+
+# Tests
+pytest>=7.4
