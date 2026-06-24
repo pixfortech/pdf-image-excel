@@ -18,3 +18,6 @@ requests>=2.31
 
 # Tests
 pytest>=7.4
+
+# Optional: only needed to run the end-to-end validation harness (scripts/real_file_validation.py)
+reportlab>=4.0
