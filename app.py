@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 from src import audit as audit_mod
-from src import excel_reader, excel_writer, extractor, parser
+from src import excel_reader, excel_writer, extractor, mapping as mapping_mod, parser
 from src.aggregator import aggregate, grouped_export_rows
 from src.mapping import (
     AppConfig,
@@ -33,7 +33,8 @@ from src.mapping import (
     config_to_json,
 )
 from src.validator import (
-    Status, build_plan, plan_to_export_rows, plan_to_write_ops,
+    Status, build_plan, configured_mapped_sheets, plan_to_export_rows,
+    plan_to_write_ops, sheet_mapping_status,
 )
 
 st.set_page_config(page_title="PDF/Image → Excel Mapper", layout="wide")
@@ -389,54 +390,147 @@ elif page == PAGES[3]:
         st.warning("No Excel workbook loaded. Go to page 1.")
     else:
         sheets = excel_reader.list_sheets(wb)
-        sheet = st.selectbox("Configure mapping for worksheet", sheets)
+        mapped_sheets = [s for s in dict.fromkeys(CFG.group_to_sheet.values()) if s]
+
+        st.caption(
+            "Configure ONE worksheet as a column/date pattern, then apply it to all "
+            "worksheets assigned to your Customer Name groups. Column letter is "
+            "preferred for copied patterns because it is reliable when headers repeat."
+        )
+        if not mapped_sheets:
+            st.info("Tip: assign Customer Names to worksheets on page 5 first, then "
+                    "apply the pattern to all of them here.")
+
+        # ---- A. Create / edit a mapping pattern from one worksheet ----
+        st.subheader("A. Create mapping pattern from this worksheet")
+        template_options = sheets
+        default_tmpl = st.session_state.get("template_sheet") or (mapped_sheets[0] if mapped_sheets else sheets[0])
+        sheet = st.selectbox("Template / sample worksheet", template_options,
+                             index=template_options.index(default_tmpl) if default_tmpl in template_options else 0)
+        st.session_state["template_sheet"] = sheet
         sm = CFG.sheets.get(sheet, SheetMapping(sheet_name=sheet))
         sm.sheet_name = sheet
 
         sm.header_row = st.number_input("Header row number", min_value=1, value=int(sm.header_row or 1))
 
-        st.subheader(f"Preview of '{sheet}'")
-        preview = excel_reader.preview_sheet(wb, sheet)
-        st.dataframe(pd.DataFrame(preview), use_container_width=True)
+        with st.expander(f"Preview of '{sheet}'", expanded=True):
+            preview = excel_reader.preview_sheet(wb, sheet)
+            st.dataframe(pd.DataFrame(preview), use_container_width=True)
 
         dups = excel_reader.find_duplicate_headers(wb, sheet, sm.header_row)
         if dups:
             st.warning(
                 f"Repeated header names in this sheet: {', '.join(dups)}. "
-                "Use column letter or exact cell reference to target these unambiguously."
+                "Prefer **column letter** or **exact cell reference** for these."
             )
 
         headers = excel_reader.header_values(wb, sheet, sm.header_row)
         header_names = [h for _, h in headers if h]
         letters = [l for l, _ in headers]
+        st.caption("Columns: " + ", ".join(f"{l}={h}" for l, h in headers if h)[:400])
 
-        st.subheader("Date column (used to find the matching row)")
-        sm.date_target_mode = TargetMode(_select("Identify date column by",
-                                                 [m.value for m in TargetMode], sm.date_target_mode.value, key="dm"))
-        sm.date_column = _column_selector("Date column", sm.date_target_mode, header_names, letters, sm.date_column, key="dcol")
-
-        st.subheader("Amount target")
-        sm.amount_target_mode = TargetMode(_select("Identify amount target by",
-                                                   [m.value for m in TargetMode], sm.amount_target_mode.value, key="am"))
-        if sm.amount_target_mode == TargetMode.CELL_REFERENCE:
-            sm.amount_cell = st.text_input("Exact amount cell (e.g. F10)", value=sm.amount_cell)
-        else:
-            sm.amount_column = _column_selector("Amount column", sm.amount_target_mode, header_names, letters, sm.amount_column, key="acol")
-
-        st.subheader("Return / deduction target (optional)")
-        sm.return_target_mode = TargetMode(_select("Identify return target by",
-                                                   [m.value for m in TargetMode], sm.return_target_mode.value, key="rm"))
-        if sm.return_target_mode == TargetMode.CELL_REFERENCE:
-            sm.return_cell = st.text_input("Exact return cell", value=sm.return_cell)
-        else:
-            sm.return_column = _column_selector("Return column", sm.return_target_mode, header_names, letters, sm.return_column, key="rcol")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Date column**")
+            sm.date_target_mode = TargetMode(_select("Identify date by",
+                                                     [m.value for m in TargetMode], sm.date_target_mode.value, key="dm"))
+            sm.date_column = _column_selector("Date column", sm.date_target_mode, header_names, letters, sm.date_column, key="dcol")
+        with c2:
+            st.markdown("**Amount target**")
+            sm.amount_target_mode = TargetMode(_select("Identify amount by",
+                                                       [m.value for m in TargetMode], sm.amount_target_mode.value, key="am"))
+            if sm.amount_target_mode == TargetMode.CELL_REFERENCE:
+                sm.amount_cell = st.text_input("Exact amount cell (e.g. F10)", value=sm.amount_cell)
+            else:
+                sm.amount_column = _column_selector("Amount column", sm.amount_target_mode, header_names, letters, sm.amount_column, key="acol")
+        with c3:
+            st.markdown("**Return target (optional)**")
+            sm.return_target_mode = TargetMode(_select("Identify return by",
+                                                       [m.value for m in TargetMode], sm.return_target_mode.value, key="rm"))
+            if sm.return_target_mode == TargetMode.CELL_REFERENCE:
+                sm.return_cell = st.text_input("Exact return cell", value=sm.return_cell)
+            else:
+                sm.return_column = _column_selector("Return column", sm.return_target_mode, header_names, letters, sm.return_column, key="rcol")
 
         dfmts = st.text_input("Worksheet date formats for text dates (comma-separated, blank = many)",
                               value=", ".join(sm.date_formats), key="sheet_dfmt")
         sm.date_formats = [f.strip() for f in dfmts.split(",") if f.strip()]
-
         CFG.sheets[sheet] = sm
-        st.success(f"Saved mapping for '{sheet}'. Configure other sheets as needed.")
+
+        st.markdown("**Write behaviour for this pattern** (applies to all sheets):")
+        wc1, wc2, wc3 = st.columns(3)
+        with wc1:
+            _OUT = {OutputType.NUMERIC.value: "Numeric total", OutputType.FORMULA.value: "Excel formula breakup"}
+            CFG.write_rules.output_type = OutputType(_select("Write mode",
+                                                             [o.value for o in OutputType], CFG.write_rules.output_type.value, key="pat_out"))
+        with wc2:
+            CFG.write_rules.write_action = WriteAction(_select("Existing value behaviour",
+                                                               [a.value for a in WriteAction], CFG.write_rules.write_action.value, key="pat_act"))
+        with wc3:
+            CFG.write_rules.date_not_found_action = DateNotFoundAction(_select("Missing date behaviour",
+                                                                               [a.value for a in DateNotFoundAction], CFG.write_rules.date_not_found_action.value, key="pat_dnf"))
+
+        # ---- B. Apply pattern to all mapped sheets ----
+        st.subheader("B. Apply pattern to all mapped worksheets")
+        st.caption(f"Mapped worksheets (from page 5): {', '.join(mapped_sheets) if mapped_sheets else '(none yet)'}")
+        targets = [s for s in mapped_sheets if s != sheet]
+        if st.button("📋 Apply this column/date pattern to all mapped worksheets",
+                     type="primary", disabled=not targets):
+            written = mapping_mod.apply_pattern_to_sheets(CFG, sheet, mapped_sheets)
+            st.success(f"Applied the '{sheet}' pattern to {len(written)} worksheet(s): "
+                       f"{', '.join(written) if written else '—'}. Override any individually in section D.")
+
+        # ---- C. Status preview ----
+        st.subheader("C. Per-sheet mapping status")
+        if mapped_sheets:
+            status_rows = sheet_mapping_status(wb, CFG)
+            st.dataframe(pd.DataFrame([{
+                "Customer Name": r["customer_name"], "Assigned Sheet": r["assigned_sheet"],
+                "Header Row": r["header_row"], "Date Column": r["date_column"],
+                "Amount Target Column": r["amount_column"], "Return Column": r["return_column"],
+                "Status": r["status"],
+            } for r in status_rows]), use_container_width=True)
+
+            configured = configured_mapped_sheets(CFG)
+            if len(mapped_sheets) > 1 and len(configured) <= 1:
+                st.warning(
+                    "Only one worksheet has column mapping. Apply this pattern to all "
+                    "mapped worksheets or configure each worksheet before writing."
+                )
+        else:
+            st.info("No groups are mapped to worksheets yet (do that on page 5).")
+
+        # ---- D. Per-sheet override ----
+        st.subheader("D. Override an individual worksheet (optional)")
+        if mapped_sheets:
+            ov_sheet = st.selectbox("Override mapping for", mapped_sheets, key="override_sheet")
+            if ov_sheet and ov_sheet != sheet:
+                osm = CFG.sheets.get(ov_sheet, SheetMapping(sheet_name=ov_sheet))
+                osm.sheet_name = ov_sheet
+                osm.header_row = st.number_input("Header row", min_value=1, value=int(osm.header_row or 1), key="ov_hr")
+                oheaders = excel_reader.header_values(wb, ov_sheet, osm.header_row)
+                ohn = [h for _, h in oheaders if h]
+                oletters = [l for l, _ in oheaders]
+                oc1, oc2, oc3 = st.columns(3)
+                with oc1:
+                    osm.date_target_mode = TargetMode(_select("Date by", [m.value for m in TargetMode], osm.date_target_mode.value, key="ov_dm"))
+                    osm.date_column = _column_selector("Date column", osm.date_target_mode, ohn, oletters, osm.date_column, key="ov_dcol")
+                with oc2:
+                    osm.amount_target_mode = TargetMode(_select("Amount by", [m.value for m in TargetMode], osm.amount_target_mode.value, key="ov_am"))
+                    if osm.amount_target_mode == TargetMode.CELL_REFERENCE:
+                        osm.amount_cell = st.text_input("Amount cell", value=osm.amount_cell, key="ov_acell")
+                    else:
+                        osm.amount_column = _column_selector("Amount column", osm.amount_target_mode, ohn, oletters, osm.amount_column, key="ov_acol")
+                with oc3:
+                    osm.return_target_mode = TargetMode(_select("Return by", [m.value for m in TargetMode], osm.return_target_mode.value, key="ov_rm"))
+                    if osm.return_target_mode == TargetMode.CELL_REFERENCE:
+                        osm.return_cell = st.text_input("Return cell", value=osm.return_cell, key="ov_rcell")
+                    else:
+                        osm.return_column = _column_selector("Return column", osm.return_target_mode, ohn, oletters, osm.return_column, key="ov_rcol")
+                CFG.sheets[ov_sheet] = osm
+                st.caption(f"Override saved for '{ov_sheet}'. This sheet no longer follows the pattern.")
+            elif ov_sheet == sheet:
+                st.caption("This is the template worksheet — edit it in section A above.")
 
 
 # ===========================================================================
@@ -525,6 +619,15 @@ elif page == PAGES[6]:
         rows = aggregate(records, CFG.source, aggregation_keys=CFG.write_rules.aggregation_keys)
         report = build_plan(wb, rows, CFG)
         st.session_state["plan"] = report
+
+        # Warn if many groups are mapped but only one sheet has a column mapping.
+        mapped_sheets = [s for s in dict.fromkeys(CFG.group_to_sheet.values()) if s]
+        configured = configured_mapped_sheets(CFG)
+        if len(mapped_sheets) > 1 and len(configured) <= 1:
+            st.warning(
+                "Only one worksheet has column mapping. Apply this pattern to all "
+                "mapped worksheets or configure each worksheet before writing (page 4)."
+            )
 
         st.subheader("Validation summary")
         cols = st.columns(5)

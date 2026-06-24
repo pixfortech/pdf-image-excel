@@ -88,6 +88,91 @@ class ValidationReport:
         return sum(1 for i in self.items if i.status == Status.READY)
 
 
+class MapStatus:
+    READY = "Ready"
+    NEEDS_REVIEW = "Needs review"
+    SHEET_MISSING = "Sheet missing"
+    DATE_MISSING = "Date column missing"
+    AMOUNT_MISSING = "Amount column missing"
+    RETURN_MISSING = "Return column missing"
+
+
+def sheet_mapping_status(wb, config: AppConfig) -> List[dict]:
+    """Per-Customer-Name view of the Excel column mapping and its status.
+
+    Returns one row per detected group->sheet assignment with columns:
+    customer_name, assigned_sheet, header_row, date_column, amount_column,
+    return_column, status.  Resolution honours header-name / column-letter /
+    cell-reference modes, so repeated headers are handled.
+    """
+    sheet_names = set(excel_reader.list_sheets(wb))
+    out: List[dict] = []
+    for group, sheet in config.group_to_sheet.items():
+        row = {
+            "customer_name": group,
+            "assigned_sheet": sheet,
+            "header_row": "",
+            "date_column": "",
+            "amount_column": "",
+            "return_column": "",
+            "status": MapStatus.NEEDS_REVIEW,
+        }
+        if not sheet:
+            out.append(row)
+            continue
+        if sheet not in sheet_names:
+            row["status"] = MapStatus.SHEET_MISSING
+            out.append(row)
+            continue
+        sm = config.sheets.get(sheet)
+        if sm is None:
+            row["status"] = MapStatus.NEEDS_REVIEW
+            out.append(row)
+            continue
+
+        row["header_row"] = sm.header_row
+        row["date_column"] = sm.date_column
+        row["amount_column"] = sm.amount_cell or sm.amount_column
+        row["return_column"] = sm.return_cell or sm.return_column
+
+        # Resolve amount.
+        if sm.amount_target_mode == TargetMode.CELL_REFERENCE and sm.amount_cell:
+            amount_ok = excel_reader.cell_reference_to_rc(sm.amount_cell) is not None
+        else:
+            amount_ok = excel_reader.resolve_column_index(
+                wb, sheet, mode=sm.amount_target_mode.value,
+                selector=sm.amount_column, header_row=sm.header_row) is not None
+        date_ok = excel_reader.resolve_column_index(
+            wb, sheet, mode=sm.date_target_mode.value,
+            selector=sm.date_column, header_row=sm.header_row) is not None or not sm.date_column
+
+        return_ok = True
+        if config.source.return_field and (sm.return_column or sm.return_cell):
+            if sm.return_target_mode == TargetMode.CELL_REFERENCE and sm.return_cell:
+                return_ok = excel_reader.cell_reference_to_rc(sm.return_cell) is not None
+            else:
+                return_ok = excel_reader.resolve_column_index(
+                    wb, sheet, mode=sm.return_target_mode.value,
+                    selector=sm.return_column, header_row=sm.header_row) is not None
+
+        if not amount_ok:
+            row["status"] = MapStatus.AMOUNT_MISSING
+        elif not date_ok:
+            row["status"] = MapStatus.DATE_MISSING
+        elif not return_ok:
+            row["status"] = MapStatus.RETURN_MISSING
+        else:
+            row["status"] = MapStatus.READY
+        out.append(row)
+    return out
+
+
+def configured_mapped_sheets(config: AppConfig) -> List[str]:
+    """Mapped worksheets (assigned to a group) that have a column mapping."""
+    mapped = {s for s in config.group_to_sheet.values() if s}
+    return [s for s in mapped if s in config.sheets]
+
+
 def build_plan(
     wb,
     rows: List[AggregatedRow],

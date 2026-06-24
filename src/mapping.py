@@ -143,6 +143,62 @@ class AppConfig:
 
 
 # ---------------------------------------------------------------------------
+# Mapping-pattern helpers
+# ---------------------------------------------------------------------------
+
+def copy_sheet_mapping(template: SheetMapping, sheet_name: str) -> SheetMapping:
+    """Return a copy of ``template``'s column/date pattern for ``sheet_name``.
+
+    Everything except the worksheet name is copied verbatim, so the same column
+    layout (date column, amount/return targets, header row, target modes, date
+    formats) is reused.  Cell-reference targets are intentionally cleared on the
+    copy because an exact cell reference (e.g. ``F10``) only makes sense for the
+    one sheet it was authored on.
+    """
+    copy = dataclasses.replace(template, sheet_name=sheet_name)
+    copy.date_formats = list(template.date_formats)
+    # Exact cell references are sheet-specific; drop them on copies so the copied
+    # pattern resolves by column instead.
+    copy.amount_cell = ""
+    copy.return_cell = ""
+    if copy.amount_target_mode == TargetMode.CELL_REFERENCE:
+        copy.amount_target_mode = TargetMode.COLUMN_LETTER
+    if copy.return_target_mode == TargetMode.CELL_REFERENCE:
+        copy.return_target_mode = TargetMode.COLUMN_LETTER
+    return copy
+
+
+def apply_pattern_to_sheets(
+    config: "AppConfig",
+    template_sheet: str,
+    target_sheets,
+    *,
+    overwrite: bool = True,
+) -> List[str]:
+    """Copy the template sheet's column pattern onto every target sheet.
+
+    ``target_sheets`` is typically every worksheet assigned to a Customer Name
+    group (``config.group_to_sheet.values()``).  Returns the list of sheet names
+    that were written.  When ``overwrite`` is False, sheets that already have a
+    mapping are left untouched (useful to preserve manual overrides).
+    """
+    template = config.sheets.get(template_sheet)
+    if template is None:
+        return []
+    written: List[str] = []
+    for sheet in dict.fromkeys(target_sheets):  # de-dup, preserve order
+        if not sheet:
+            continue
+        if sheet == template_sheet:
+            continue
+        if not overwrite and sheet in config.sheets:
+            continue
+        config.sheets[sheet] = copy_sheet_mapping(template, sheet)
+        written.append(sheet)
+    return written
+
+
+# ---------------------------------------------------------------------------
 # (De)serialisation helpers
 # ---------------------------------------------------------------------------
 

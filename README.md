@@ -95,18 +95,40 @@ formats) and whether to **sum duplicate dates**.
 
 ## 7. Map Excel sheets and columns
 
-On **page 4 (Excel Mapping)**:
+First, on **page 5 (Group → Sheet Mapping)** assign each detected Customer Name
+group to a worksheet (or skip it). Group name and worksheet name are
+independent — e.g. `BARANAGAR → BN`, `BEADON STREET → BD`, `KESTOPUR → KP`.
 
-* Pick a worksheet and its **header row**.
-* See a live preview of the sheet.
-* Choose the **date column** and the **amount / return targets**.
-* Select targets **by header name, column letter, or exact cell reference** —
-  important when a sheet has **repeated header names** (e.g. several columns all
-  labelled the same). Column letter / cell reference make the target
-  unambiguous.
+Then, on **page 4 (Excel Mapping)** you do **not** have to configure every sheet
+by hand. Most branch sheets share the same layout, so the page works as a
+**mapping pattern (template)**:
 
-On **page 5 (Group → Sheet Mapping)** assign each detected group to a worksheet
-(or skip it). Group name and worksheet name are independent.
+* **A. Create mapping pattern from this worksheet** — pick one sample worksheet
+  and define its **header row**, **date column**, **amount target column**,
+  **return target column**, plus the **write mode**, **existing-value
+  behaviour** and **missing-date behaviour**.
+* **B. Apply this column/date pattern to all mapped worksheets** — one click
+  copies that column pattern to every worksheet assigned to a group. Each copy
+  keeps its own sheet name; only the column layout is shared. **Column letter is
+  preferred** for copied patterns because it is reliable when headers repeat
+  (exact cell references are sheet-specific and are dropped on copies).
+* **C. Per-sheet mapping status** — a table showing, per Customer Name: assigned
+  sheet, header row, date column, amount/return columns and a **status**
+  (`Ready`, `Sheet missing`, `Date column missing`, `Amount column missing`,
+  `Return column missing`, `Needs review`).
+* **D. Override an individual worksheet** — if one sheet has a different
+  structure, override just that sheet; the others keep the pattern.
+
+Targets can always be selected **by header name, column letter, or exact cell
+reference**, which matters when a sheet has **repeated header names**.
+
+If several groups are mapped but only one worksheet has a column mapping, the
+app warns: *"Only one worksheet has column mapping. Apply this pattern to all
+mapped worksheets or configure each worksheet before writing."*
+
+The final write preview uses the worksheet **assigned to each Customer Name**
+with that sheet's own column mapping — it never writes every group into the one
+template worksheet.
 
 On **page 6 (Aggregation & Write Rules)** choose aggregation keys, sum behaviour,
 what to do with existing cell values (**replace / add / skip / ask**), the
@@ -176,8 +198,11 @@ duplicate group/date rows, non-hardcoded group→sheet mapping, column selection
 by letter, repeated Excel headers, formula preservation, no-overwrite-without-
 confirmation, audit generation, the **numeric-total vs Excel-formula-breakup**
 behaviour (`630.00 + 12,705.00` → numeric `13335.00` and formula `=630+12705`,
-with commas stripped from formulas), and appending multiple missing dates to
-distinct rows.
+with commas stripped from formulas), appending multiple missing dates to
+distinct rows, and the **Excel mapping-pattern** workflow (copying one
+worksheet's column pattern to many mapped sheets, per-sheet overrides, and
+verifying each Customer Name writes to its own assigned sheet rather than the
+template sheet).
 
 ---
 
@@ -206,7 +231,7 @@ pdf-image-excel/
     utils.py         amount & date parsing primitives
   tests/
     test_extractor.py  test_parser.py  test_mapping.py
-    test_aggregator.py test_excel_writer.py
+    test_aggregator.py test_excel_writer.py test_excel_mapping.py
     test_formula.py    test_end_to_end.py
   scripts/
     real_file_validation.py   end-to-end harness (generates real PDF + .xlsx,
