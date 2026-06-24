@@ -39,8 +39,9 @@ class WriteOp:
     action: WriteAction = WriteAction.REPLACE
     output_type: OutputType = OutputType.NUMERIC
     comment: str = ""
-    insert_row: bool = False          # insert a new row at ``row`` before writing
-    template_row: Optional[int] = None  # row to copy formatting from when inserting
+    insert_row: bool = False          # physically insert a new row at ``row`` before writing
+    append_only: bool = False         # write below existing data (no physical insert)
+    template_row: Optional[int] = None  # row to copy formatting from when inserting/appending
     label: str = ""                   # human label for audit
 
 
@@ -84,15 +85,20 @@ def apply_writes(
     wb = load_workbook(io.BytesIO(bytes(original_bytes)), data_only=False)
     outcomes: List[WriteOutcome] = []
 
-    # Group inserts by sheet and process from the bottom up so row indexes stay
-    # valid while inserting.
-    insert_ops = [o for o in ops if o.insert_row]
-    normal_ops = [o for o in ops if not o.insert_row]
+    # Physical mid-sheet inserts: process from the bottom up so row indexes
+    # stay valid while inserting. Appends need no physical insert (the rows are
+    # below existing data); we only copy formatting from a template row.
+    insert_ops = [o for o in ops if o.insert_row and not o.append_only]
+    append_ops = [o for o in ops if o.append_only]
+    normal_ops = [o for o in ops if not o.insert_row and not o.append_only]
 
     for op in sorted(insert_ops, key=lambda o: (-o.row,)):
         _do_insert(wb, op)
 
-    for op in normal_ops + insert_ops:
+    for op in append_ops:
+        _copy_row_format(wb, op)
+
+    for op in normal_ops + insert_ops + append_ops:
         outcomes.append(_write_one(wb, op, conflict_resolver))
 
     buf = io.BytesIO()
@@ -113,6 +119,20 @@ def _do_insert(wb, op: WriteOp) -> None:
             if src.has_style:
                 dst._style = copy.copy(src._style)
             dst.number_format = src.number_format
+
+
+def _copy_row_format(wb, op: WriteOp) -> None:
+    """Copy style/number-format from a template row onto an append target row,
+    without inserting (the append row sits below existing data)."""
+    if op.template_row is None:
+        return
+    ws = wb[op.sheet_name]
+    for c in range(1, ws.max_column + 1):
+        src = ws.cell(row=op.template_row, column=c)
+        dst = ws.cell(row=op.row, column=c)
+        if src.has_style:
+            dst._style = copy.copy(src._style)
+        dst.number_format = src.number_format
 
 
 def _write_one(wb, op: WriteOp, conflict_resolver) -> WriteOutcome:

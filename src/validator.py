@@ -47,10 +47,12 @@ class PlanItem:
     target_column_letter: str = ""
     target_cell: str = ""
     source_amounts: List[float] = field(default_factory=list)
-    aggregated_amount: float = 0.0
+    aggregated_amount: float = 0.0          # numeric total, ALWAYS kept
+    invoice_breakup: str = ""               # human-readable, e.g. "630.00 + 12,705.00"
+    excel_formula_breakup: str = ""         # formula, e.g. "=630+12705"
     return_amount: float = 0.0
     existing_value: object = None
-    final_value: object = None
+    final_value: object = None              # numeric total or formula (per write mode)
     write_action: str = ""
     status: str = Status.READY
     messages: List[str] = field(default_factory=list)
@@ -58,7 +60,9 @@ class PlanItem:
     return_existing_value: object = None
     source_records: List[dict] = field(default_factory=list)
     is_insert: bool = False
+    is_append: bool = False          # appended below existing data (no physical row insert)
     template_row: Optional[int] = None
+    date_column: Optional[int] = None  # resolved date column index (for inserts)
 
 
 @dataclass
@@ -99,6 +103,10 @@ def build_plan(
             if dups:
                 report.duplicate_headers[sheet_name] = dups
 
+    # Per-sheet cursor so that multiple missing dates appended to the same sheet
+    # land on distinct, sequential rows instead of all colliding at max_row+1.
+    append_cursor: Dict[str, int] = {}
+
     for agg in rows:
         item = PlanItem(
             group=agg.group,
@@ -107,6 +115,8 @@ def build_plan(
             source_amounts=[r.get(config.source.amount_field, "") for r in agg.source_records]
             if config.source.amount_field else [],
             aggregated_amount=agg.amount,
+            invoice_breakup=agg.invoice_breakup,
+            excel_formula_breakup=agg.excel_formula_breakup,
             return_amount=agg.return_amount,
             source_records=agg.source_records,
         )
@@ -188,24 +198,31 @@ def build_plan(
                 date_formats=sm.date_formats or None,
             ) if date_col else None
 
+            item.date_column = date_col
             if matched is None:
                 action = config.write_rules.date_not_found_action
-                if action == DateNotFoundAction.INSERT_ROW or config.write_rules.insert_missing_date_rows:
+                do_insert = (action in (DateNotFoundAction.INSERT_ROW, DateNotFoundAction.COPY_NEAREST)
+                             or config.write_rules.insert_missing_date_rows)
+                if do_insert:
+                    ws = wb[sheet]
+                    base = _insert_position(wb, sheet, date_col, agg.date, sm)
+                    cursor = append_cursor.get(sheet)
+                    if base > ws.max_row:
+                        # Append below existing data: distinct sequential rows.
+                        row = cursor if cursor is not None else base
+                        item.is_append = True
+                        item.messages.append("Date not found; will append a new row.")
+                    else:
+                        # Mid-sheet insert: offset by inserts already planned above.
+                        row = base if cursor is None else max(base, cursor)
+                        item.messages.append("Date not found; will insert a new row.")
+                    append_cursor[sheet] = row + 1
                     item.is_insert = True
-                    item.matched_row = _insert_position(wb, sheet, date_col, agg.date, sm)
+                    item.matched_row = row
                     item.template_row = excel_reader.nearest_date_row(
                         wb, sheet, date_col, agg.date,
                         header_row=sm.header_row, date_formats=sm.date_formats or None,
                     )
-                    item.messages.append("Date not found; will insert a new row.")
-                elif action == DateNotFoundAction.COPY_NEAREST:
-                    item.template_row = excel_reader.nearest_date_row(
-                        wb, sheet, date_col, agg.date,
-                        header_row=sm.header_row, date_formats=sm.date_formats or None,
-                    )
-                    item.is_insert = True
-                    item.matched_row = _insert_position(wb, sheet, date_col, agg.date, sm)
-                    item.messages.append("Date not found; will copy formatting from nearest row.")
                 else:
                     item.status = Status.DATE_NOT_FOUND
                     item.messages.append("Matching date row not found in worksheet.")
@@ -273,20 +290,14 @@ def _insert_position(wb, sheet, date_col, target_date, sm) -> int:
 
 
 def _compute_final_value(item: PlanItem, agg: AggregatedRow, config: AppConfig):
+    """Pick the value to write based on the chosen output mode.
+
+    The numeric total (``item.aggregated_amount``) is always preserved on the
+    plan item; this only decides what lands in the target cell.
+    """
     if config.write_rules.output_type == OutputType.FORMULA:
-        amounts = []
-        for raw in item.source_amounts:
-            v = utils.parse_amount(
-                raw,
-                decimal_sep=config.source.decimal_sep,
-                thousands_sep=config.source.thousands_sep,
-                currency_chars=config.source.currency_chars,
-            )
-            if v is not None:
-                amounts.append(v)
-        if amounts:
-            return build_formula(amounts)
-        return build_formula([agg.amount])
+        # Use the precomputed comma-free formula, e.g. "=630+12705".
+        return agg.excel_formula_breakup or build_formula([agg.amount])
     if config.write_rules.write_action == WriteAction.ADD:
         base = item.existing_value if isinstance(item.existing_value, (int, float)) else 0
         return round((base or 0) + agg.amount, 4)
@@ -306,6 +317,25 @@ def plan_to_write_ops(report: ValidationReport, config: AppConfig) -> List[Write
             lines = [str(r.get("_source_text", "")) for r in item.source_records]
             comment = "Source rows:\n" + "\n".join(l for l in lines if l)
 
+        # For inserted/appended rows, also stamp the date into the date column so
+        # the new row is identifiable. Whichever op for this row comes first
+        # performs the physical insert / formatting copy.
+        date_op_added = False
+        if item.is_insert and item.date_column and item.date is not None:
+            ops.append(WriteOp(
+                sheet_name=item.sheet,
+                row=item.matched_row,
+                column=item.date_column,
+                value=item.date,
+                action=WriteAction.REPLACE,
+                output_type=OutputType.NUMERIC,
+                insert_row=item.is_insert and not item.is_append,
+                append_only=item.is_append,
+                template_row=item.template_row,
+                label=f"{item.group} / {item.date_raw} (date)",
+            ))
+            date_op_added = True
+
         ops.append(WriteOp(
             sheet_name=item.sheet,
             row=item.matched_row,
@@ -314,7 +344,10 @@ def plan_to_write_ops(report: ValidationReport, config: AppConfig) -> List[Write
             action=config.write_rules.write_action,
             output_type=config.write_rules.output_type,
             comment=comment,
-            insert_row=item.is_insert,
+            # If a date op already inserted/formatted this row, the amount op just
+            # writes its cell; otherwise the amount op performs the insert/append.
+            insert_row=item.is_insert and not item.is_append and not date_op_added,
+            append_only=item.is_append and not date_op_added,
             template_row=item.template_row,
             label=f"{item.group} / {item.date_raw}",
         ))
@@ -331,3 +364,34 @@ def plan_to_write_ops(report: ValidationReport, config: AppConfig) -> List[Write
                 label=f"{item.group} / {item.date_raw} (return)",
             ))
     return ops
+
+
+def plan_to_export_rows(report: ValidationReport, config: AppConfig) -> List[dict]:
+    """Flatten the write plan into export rows (for write_plan.csv).
+
+    Always includes the numeric ``aggregated_amount``, the human-readable
+    ``invoice_breakup`` and the ``excel_formula_breakup`` so all three value
+    forms are visible regardless of the chosen write mode.
+    """
+    mode = config.write_rules.output_type.value
+    out: List[dict] = []
+    for it in report.items:
+        out.append({
+            "customer_name": it.group,
+            "worksheet": it.sheet,
+            "date": it.date_raw,
+            "num_source_rows": len(it.source_records),
+            "invoice_breakup": it.invoice_breakup,
+            "aggregated_amount": round(it.aggregated_amount, 2),
+            "excel_formula_breakup": it.excel_formula_breakup,
+            "return_amount": round(it.return_amount, 2),
+            "matched_row": it.matched_row,
+            "target_column": it.target_column_letter,
+            "target_cell": it.target_cell,
+            "existing_value": it.existing_value,
+            "write_mode": mode,
+            "value_to_write": it.final_value,
+            "status": it.status,
+            "messages": "; ".join(it.messages),
+        })
+    return out

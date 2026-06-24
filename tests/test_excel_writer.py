@@ -144,6 +144,44 @@ def test_no_overwrite_without_confirmation():
     assert out_wb["S1"]["C2"].value == 999   # original value untouched
 
 
+def test_multiple_missing_dates_append_to_distinct_rows():
+    """Several missing dates under one group must NOT collide on one row."""
+    data = _make_workbook_bytes()  # has dates 15/05 and 16/05 only
+    text = """\
+Customer Name: SOME GROUP
+A1   20/05/2026   100.00
+A2   21/05/2026   200.00
+A3   22/05/2026   300.00
+"""
+    records = parse_text_lines([text], group_label="Customer Name",
+                               field_names=["Inv No", "Inv Date", "Amount"])
+    cfg = _config_for_letter_target()
+    cfg.write_rules.insert_missing_date_rows = True
+    rows = aggregate(records, cfg.source, aggregation_keys=cfg.write_rules.aggregation_keys)
+    wb = excel_reader.open_workbook(data)
+    report = build_plan(wb, rows, cfg)
+
+    inserted = [i for i in report.items if i.is_insert]
+    assert len(inserted) == 3
+    target_rows = [i.matched_row for i in inserted]
+    assert len(set(target_rows)) == 3          # distinct rows, no collision
+
+    ops = plan_to_write_ops(report, cfg)
+    out_bytes, _ = apply_writes(data, ops)
+    out_wb = openpyxl.load_workbook(io.BytesIO(out_bytes))
+    ws = out_wb["S1"]
+    # Each appended row holds its own amount and its own stamped date.
+    by_amount = {}
+    for i in inserted:
+        by_amount[i.aggregated_amount] = i.matched_row
+    assert ws.cell(row=by_amount[100.0], column=3).value == 100.0   # target column "C"
+    assert ws.cell(row=by_amount[300.0], column=3).value == 300.0
+    # Date stamped into the date column ("A") of each appended row.
+    from src import utils
+    assert utils.parse_date(ws.cell(row=by_amount[100.0], column=1).value) == dt.date(2026, 5, 20)
+    assert ws["E2"].value == "=B2+C2"          # pre-existing formula untouched
+
+
 def test_backup_is_exact_copy():
     data = _make_workbook_bytes()
     backup = excel_writer.make_backup(data)

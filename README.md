@@ -109,8 +109,30 @@ On **page 5 (Group → Sheet Mapping)** assign each detected group to a workshee
 (or skip it). Group name and worksheet name are independent.
 
 On **page 6 (Aggregation & Write Rules)** choose aggregation keys, sum behaviour,
-what to do with existing cell values (**replace / add / skip / ask**), numeric
-vs Excel-formula output, and what to do when a date row is missing.
+what to do with existing cell values (**replace / add / skip / ask**), the
+**output mode** (see below), and what to do when a date row is missing.
+
+### Output mode: numeric total vs Excel formula breakup
+
+For every aggregated group/date the app keeps **three** value forms, and the
+numeric total is **always** preserved (never replaced) for audit and accounting:
+
+| Field | Example | Purpose |
+|-------|---------|---------|
+| `aggregated_amount` | `13335.00` | clean numeric total — safe for accounting, CSV, audit |
+| `invoice_breakup` | `630.00 + 12,705.00` | human-readable preview (plain text, **not** a formula) |
+| `excel_formula_breakup` | `=630+12705` | a real Excel formula — starts with `=`, **no** thousands separators |
+
+The **Output mode** radio on page 6 decides what is written into the target cell:
+
+* **Numeric total** — writes the numeric `aggregated_amount` (e.g. `13335.0`).
+  Recommended for the actual accounting sheet: cleaner and safer.
+* **Excel formula breakup** — writes the `excel_formula_breakup` (e.g.
+  `=630+12705`) so Excel shows and recalculates the breakup.
+
+All three values appear in the final write-plan preview, in `write_plan.csv`,
+in `grouped_totals.csv`, and in the audit report — regardless of which output
+mode you pick.
 
 ## 8. Confirm before writing
 
@@ -126,9 +148,10 @@ On **page 8 (Export)** download:
 
 * The **updated Excel workbook** (a new file; your original is never modified)
 * A **backup** of the original
-* **Audit report** as CSV and JSON
+* **Audit report** as CSV and JSON (includes numeric total, invoice breakup and Excel formula breakup)
 * **Extracted raw data** CSV
-* **Grouped / aggregated data** CSV
+* **Grouped / aggregated data** CSV (`grouped_totals.csv` — numeric total + breakup + formula)
+* **Write plan** CSV (`write_plan.csv` — per target cell, all three value forms + write mode)
 * The **saved mapping** JSON
 * An **error / warning report** CSV
 
@@ -151,7 +174,10 @@ The tests cover grouped-row extraction, group continuation across page breaks,
 ignoring repeated headers/totals, comma amount parsing, date parsing, summing
 duplicate group/date rows, non-hardcoded group→sheet mapping, column selection
 by letter, repeated Excel headers, formula preservation, no-overwrite-without-
-confirmation, and audit generation.
+confirmation, audit generation, the **numeric-total vs Excel-formula-breakup**
+behaviour (`630.00 + 12,705.00` → numeric `13335.00` and formula `=630+12705`,
+with commas stripped from formulas), and appending multiple missing dates to
+distinct rows.
 
 ---
 
@@ -181,6 +207,10 @@ pdf-image-excel/
   tests/
     test_extractor.py  test_parser.py  test_mapping.py
     test_aggregator.py test_excel_writer.py
+    test_formula.py    test_end_to_end.py
+  scripts/
+    real_file_validation.py   end-to-end harness (generates real PDF + .xlsx,
+                              or accepts your real file paths as arguments)
 ```
 
 ## Design notes on safety & "no hardcoding"

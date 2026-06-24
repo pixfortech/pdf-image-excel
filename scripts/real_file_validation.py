@@ -243,8 +243,14 @@ def main():
               f"{str(it.existing_value):<10}{str(it.final_value):<10}{it.status}")
 
     alpha_item = [i for i in report.items if i.group == CUST_A and i.date_raw == "15/05/2026"][0]
-    check("Preview shows aggregated 13,335.00 for ALPHA 15/05/2026",
-          round(alpha_item.final_value, 2) == 13335.00)
+    check("Preview shows numeric total 13,335.00 for ALPHA 15/05/2026",
+          round(alpha_item.aggregated_amount, 2) == 13335.00)
+    check("Preview shows human-readable invoice breakup",
+          alpha_item.invoice_breakup == "630.00 + 12,705.00", alpha_item.invoice_breakup)
+    check("Preview shows comma-free Excel formula breakup",
+          alpha_item.excel_formula_breakup == "=630+12705", alpha_item.excel_formula_breakup)
+    check("Formula breakup contains no thousands separators",
+          "," not in alpha_item.excel_formula_breakup)
     check("Preview shows the matched target cell", bool(alpha_item.target_cell))
     check("Preview shows existing Excel value (empty before write)",
           alpha_item.existing_value in (None, ""))

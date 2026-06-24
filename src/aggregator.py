@@ -25,8 +25,21 @@ class AggregatedRow:
     return_amount: float
     source_row_indexes: List[int] = field(default_factory=list)
     source_records: List[dict] = field(default_factory=list)  # invoice breakup
+    source_amount_raw: List[str] = field(default_factory=list)     # original amount strings
+    source_amount_values: List[float] = field(default_factory=list)  # parsed amounts
     warnings: List[str] = field(default_factory=list)
     extra_key: str = ""   # value of the optional extra aggregation field
+
+    # --- presentation helpers (numeric total is always kept separately) ---
+    @property
+    def invoice_breakup(self) -> str:
+        """Human-readable breakup, e.g. ``630.00 + 12,705.00`` (NOT a formula)."""
+        return " + ".join(s for s in self.source_amount_raw if s)
+
+    @property
+    def excel_formula_breakup(self) -> str:
+        """Excel formula breakup, e.g. ``=630+12705`` (no commas, leading ``=``)."""
+        return build_formula(self.source_amount_values)
 
 
 def _get_field(rec: Record, field_name: str) -> str:
@@ -110,6 +123,8 @@ def aggregate(
                 return_amount=return_amount or 0.0,
                 source_row_indexes=[rec.row_index],
                 source_records=[dict(rec.fields, _page=rec.page, _source_text=rec.source_text)],
+                source_amount_raw=[amount_raw] if source.amount_field else [],
+                source_amount_values=[amount] if (source.amount_field and amount is not None) else [],
                 warnings=list(warnings),
                 extra_key=extra_key,
             )
@@ -122,6 +137,10 @@ def aggregate(
                 agg.return_amount += return_amount
             agg.source_row_indexes.append(rec.row_index)
             agg.source_records.append(dict(rec.fields, _page=rec.page, _source_text=rec.source_text))
+            if source.amount_field:
+                agg.source_amount_raw.append(amount_raw)
+                if amount is not None:
+                    agg.source_amount_values.append(amount)
             agg.warnings.extend(warnings)
 
     return [buckets[k] for k in order]
@@ -134,7 +153,47 @@ def group_totals(rows: Sequence[AggregatedRow]) -> Dict[str, float]:
     return totals
 
 
+def _fmt_num(a: float) -> str:
+    """Format a number for use inside a formula: no thousands separators, no
+    needless trailing zeros (``630.0`` -> ``630``, ``12.50`` -> ``12.5``)."""
+    s = f"{a:.4f}".rstrip("0").rstrip(".")
+    return s if s not in ("", "-0") else "0"
+
+
 def build_formula(amounts: Sequence[float]) -> str:
-    """Build an Excel SUM-style formula showing the source breakup."""
-    parts = "+".join(f"{a:g}" for a in amounts)
-    return f"={parts}" if parts else "=0"
+    """Build an Excel formula showing the source breakup.
+
+    Examples: ``[630.0, 12705.0]`` -> ``=630+12705``;
+    ``[100.0, -20.0]`` -> ``=100-20``. Never contains thousands separators.
+    """
+    amounts = list(amounts)
+    if not amounts:
+        return "=0"
+    out = _fmt_num(amounts[0])
+    for a in amounts[1:]:
+        if a < 0:
+            out += "-" + _fmt_num(-a)
+        else:
+            out += "+" + _fmt_num(a)
+    return f"={out}"
+
+
+def grouped_export_rows(rows: Sequence[AggregatedRow]) -> List[dict]:
+    """Build the grouped/aggregated export rows with all three value forms.
+
+    Columns: customer/group, date, numeric ``aggregated_amount``, human-readable
+    ``invoice_breakup`` and ``excel_formula_breakup`` (a real ``=...`` formula).
+    The numeric total is ALWAYS kept alongside the formula, never replaced.
+    """
+    out: List[dict] = []
+    for r in rows:
+        out.append({
+            "group": r.group,
+            "date": r.date_raw,
+            "aggregated_amount": round(r.amount, 2),
+            "return_amount": round(r.return_amount, 2),
+            "num_source_rows": len(r.source_row_indexes),
+            "invoice_breakup": r.invoice_breakup,
+            "excel_formula_breakup": r.excel_formula_breakup,
+        })
+    return out

@@ -19,7 +19,7 @@ import streamlit as st
 
 from src import audit as audit_mod
 from src import excel_reader, excel_writer, extractor, parser
-from src.aggregator import aggregate
+from src.aggregator import aggregate, grouped_export_rows
 from src.mapping import (
     AppConfig,
     DateNotFoundAction,
@@ -32,7 +32,9 @@ from src.mapping import (
     config_from_json,
     config_to_json,
 )
-from src.validator import Status, build_plan, plan_to_write_ops
+from src.validator import (
+    Status, build_plan, plan_to_export_rows, plan_to_write_ops,
+)
 
 st.set_page_config(page_title="PDF/Image → Excel Mapper", layout="wide")
 
@@ -465,8 +467,21 @@ elif page == PAGES[5]:
         st.subheader("Write behaviour")
         wr.write_action = WriteAction(_select("On existing cell value",
                                               [a.value for a in WriteAction], wr.write_action.value))
-        wr.output_type = OutputType(_select("Output type",
-                                            [o.value for o in OutputType], wr.output_type.value))
+        # Output mode: numeric total vs Excel formula breakup.
+        _OUT_LABELS = {OutputType.NUMERIC.value: "Numeric total (recommended for accounting)",
+                       OutputType.FORMULA.value: "Excel formula breakup (=630+12705)"}
+        out_choice = st.radio(
+            "Output mode (what lands in the target cell)",
+            [OutputType.NUMERIC.value, OutputType.FORMULA.value],
+            index=[OutputType.NUMERIC.value, OutputType.FORMULA.value].index(wr.output_type.value),
+            format_func=lambda v: _OUT_LABELS[v],
+        )
+        wr.output_type = OutputType(out_choice)
+        st.caption(
+            "The numeric total is always kept for audit/CSV regardless of this choice. "
+            "Numeric mode writes e.g. 13335.0; formula mode writes e.g. =630+12705 so "
+            "Excel shows the breakup and recalculates."
+        )
         wr.add_source_comment = st.checkbox("Add a cell comment with source rows", value=wr.add_source_comment)
 
     st.subheader("When the date is not found in the worksheet")
@@ -507,22 +522,25 @@ elif page == PAGES[6]:
             for sh, d in report.duplicate_headers.items():
                 st.warning(f"Sheet '{sh}' has duplicate headers: {', '.join(d)}")
 
-        st.subheader("Write plan (exactly what will happen)")
+        write_mode = CFG.write_rules.output_type.value
+        st.subheader(f"Write plan (exactly what will happen) — write mode: {write_mode}")
+        st.caption("All three value forms are shown. Only 'Value to write' lands in the cell.")
         plan_rows = []
         for it in report.items:
             plan_rows.append({
-                "Group": it.group,
+                "Customer Name": it.group,
                 "Worksheet": it.sheet,
-                "Source date": it.date_raw,
-                "Matched row": it.matched_row,
-                "Target column": it.target_column_letter,
-                "Target cell": it.target_cell,
-                "Source amounts": ", ".join(str(a) for a in it.source_amounts),
-                "Aggregated": it.aggregated_amount,
+                "Date": it.date_raw,
+                "Source rows": len(it.source_records),
+                "Invoice breakup": it.invoice_breakup,
+                "Numeric total": it.aggregated_amount,
+                "Excel formula": it.excel_formula_breakup,
                 "Return": it.return_amount,
+                "Matched row": it.matched_row,
+                "Target cell": it.target_cell,
                 "Existing value": it.existing_value,
-                "Final value": it.final_value,
-                "Action": it.write_action or ("insert" if it.is_insert else ""),
+                "Value to write": it.final_value,
+                "Write mode": write_mode,
                 "Status": it.status,
                 "Messages": "; ".join(it.messages),
             })
@@ -581,19 +599,23 @@ elif page == PAGES[7]:
                                data=df.to_csv(index=False), file_name="raw_extracted.csv", mime="text/csv")
             records = df_to_records(df)
             rows = aggregate(records, CFG.source, aggregation_keys=CFG.write_rules.aggregation_keys)
-            agg_rows = [{
-                "group": r.group, "date": r.date_raw, "amount": r.amount,
-                "return_amount": r.return_amount, "source_rows": len(r.source_row_indexes),
-            } for r in rows]
+            # Grouped totals now include numeric total + human breakup + excel formula breakup.
+            agg_rows = grouped_export_rows(rows)
             st.download_button("⬇️ Grouped / aggregated data (CSV)",
                                data=audit_mod.records_to_csv(agg_rows),
-                               file_name="aggregated.csv", mime="text/csv")
+                               file_name="grouped_totals.csv", mime="text/csv")
+
+        # Write plan export (numeric total, breakup and formula, per target cell).
+        report = st.session_state["plan"]
+        if report is not None:
+            st.download_button("⬇️ Write plan (CSV)",
+                               data=audit_mod.records_to_csv(plan_to_export_rows(report, CFG)),
+                               file_name="write_plan.csv", mime="text/csv")
 
         st.download_button("⬇️ Saved mapping (JSON)",
                            data=config_to_json(CFG), file_name="mapping.json", mime="application/json")
 
         # Error / warning report.
-        report = st.session_state["plan"]
         if report is not None:
             warn_rows = [{"group": it.group, "status": it.status, "messages": "; ".join(it.messages)}
                          for it in report.items if it.status != Status.READY or it.messages]
