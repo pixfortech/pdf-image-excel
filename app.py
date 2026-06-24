@@ -33,8 +33,8 @@ from src.mapping import (
     config_to_json,
 )
 from src.validator import (
-    Status, build_plan, configured_mapped_sheets, plan_to_export_rows,
-    plan_to_write_ops, sheet_mapping_status,
+    Status, build_plan, configured_mapped_sheets, excel_date_debug_rows,
+    plan_to_export_rows, plan_to_write_ops, sheet_mapping_status,
 )
 
 st.set_page_config(page_title="PDF/Image → Excel Mapper", layout="wide")
@@ -682,15 +682,35 @@ elif page == PAGES[6]:
                 info = excel_reader.analyze_date_column(
                     wb, sheet, date_col, set(pdf_dates), header_row=sm.header_row,
                     date_formats=sm.date_formats or None, interpretation=interp)
-                st.write(f"Matched {info['matched']} / {info['total_targets']} PDF dates "
-                         f"({info['missing']} missing). First parsed Excel dates:")
-                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["sample"]])
+                a, b = st.columns(2)
+                a.metric("Matched", f"{info['matched']} / {info['total_targets']}")
+                b.metric("Missing", info["missing"])
+                st.write(f"Excel date range (full column scan): **{info['min_date']} … "
+                         f"{info['max_date']}**  ·  parseable date cells: {info['parsed_count']}")
+                if pdf_dates and info["min_date"] and info["max_date"] \
+                        and info["min_date"] <= pdf_dates[0] and pdf_dates[-1] <= info["max_date"] \
+                        and info["missing"] > 0:
+                    st.error("PDF date range is inside the Excel date range, yet some dates were "
+                             "not matched — flagged as an error in the plan (missing rows or "
+                             "format mismatch).")
+                st.caption("First 10 parsed Excel dates (raw → normalised):")
+                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["first10"]])
+                st.caption("Last 10 parsed Excel dates (raw → normalised):")
+                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["last10"]])
                 sugg = excel_reader.suggest_date_columns(
                     wb, sheet, set(pdf_dates), header_row=sm.header_row,
                     date_formats=sm.date_formats or None, interpretation=interp)
                 if sugg:
                     st.write("Suggested date columns (by match count): "
                              + ", ".join(f"{l} ({h or 'no header'}): {m} matched" for l, h, m, _ in sugg))
+
+            # Debug export: real stored value / data type / number format per cell.
+            debug_rows = excel_date_debug_rows(wb, CFG)
+            if debug_rows:
+                st.download_button(
+                    "⬇️ excel_date_debug.csv (real cell values, data type, number format)",
+                    data=audit_mod.records_to_csv(debug_rows),
+                    file_name="excel_date_debug.csv", mime="text/csv")
 
         write_mode = CFG.write_rules.output_type.value
         st.subheader(f"Write plan (exactly what will happen) — write mode: {write_mode}")
@@ -785,6 +805,15 @@ elif page == PAGES[7]:
             st.download_button("⬇️ Write plan (CSV)",
                                data=audit_mod.records_to_csv(plan_to_export_rows(report, CFG)),
                                file_name="write_plan.csv", mime="text/csv")
+
+        # Excel date debug export (real cell value / data type / number format).
+        wb_dbg = workbook()
+        if wb_dbg is not None:
+            dbg = excel_date_debug_rows(wb_dbg, CFG)
+            if dbg:
+                st.download_button("⬇️ excel_date_debug.csv",
+                                   data=audit_mod.records_to_csv(dbg),
+                                   file_name="excel_date_debug.csv", mime="text/csv")
 
         st.download_button("⬇️ Saved mapping (JSON)",
                            data=config_to_json(CFG), file_name="mapping.json", mime="application/json")

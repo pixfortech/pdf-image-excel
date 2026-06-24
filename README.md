@@ -111,11 +111,25 @@ A **Date interpretation** setting disambiguates numeric dates like `05/06/2026`:
 * **US — MM/DD/YYYY** → 6 May 2026… i.e. May 6
 * **Auto-detect**
 
-If the selected Excel date column matches few PDF dates, page 7 shows a date
-analysis (selected column, first parsed Excel dates, PDF date range, matched /
-missing counts, and **suggested alternative date columns**). If more than 25% of
-PDF dates are missing, a **strong warning** explains the likely cause (wrong date
-column, wrong worksheet, wrong workbook year, or missing rows).
+**Excel dates are read by their real stored value, never by display
+formatting.** A cell formatted `d-mmm` shows `04-Jan` but stores a real
+`datetime(2026, 1, 4)`; openpyxl returns the true datetime, so the year is taken
+from the value, not the display. The full date column is scanned (not just a
+preview window).
+
+Page 7 shows a date-matching analysis per mapped sheet: selected date column,
+the **first 10 and last 10** parsed Excel dates (raw → normalised), the
+**minimum and maximum** Excel date (full-column scan), the PDF date range,
+matched / missing counts, and **suggested alternative date columns**. A
+**`excel_date_debug.csv`** export lists every date cell's `raw_cell_value`,
+`cell_data_type`, `number_format` and `parsed_date` so a formatting issue is
+distinguishable from a wrong-year/missing-row issue.
+
+If more than 25% of PDF dates are missing, a **strong warning** explains the
+likely cause and shows both date ranges. If a PDF date falls **within** the
+Excel column's date range but no exact row exists (or a date present in the
+column fails to match — a genuine bug), the row is flagged as an **error** so
+nothing is written until it is resolved.
 
 Missing dates are **never inserted silently** — the default action is **skip**;
 rows are inserted/copied only if you explicitly choose that behaviour on page 6.
@@ -262,7 +276,8 @@ pdf-image-excel/
   tests/
     test_extractor.py  test_parser.py  test_mapping.py
     test_aggregator.py test_excel_writer.py test_excel_mapping.py
-    test_formula.py    test_dates.py     test_end_to_end.py
+    test_formula.py    test_dates.py     test_excel_dates.py
+    test_end_to_end.py
   scripts/
     real_file_validation.py   end-to-end harness (generates real PDF + .xlsx,
                               or accepts your real file paths as arguments)

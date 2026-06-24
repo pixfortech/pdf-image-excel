@@ -206,6 +206,20 @@ def build_plan(
     # >25%-missing warning and the date-column suggestions).
     per_sheet_targets: Dict[str, set] = {}
     per_sheet_missing: Dict[str, int] = {}
+    # Cache the full date-column scan per (sheet, col): (date_set, min, max).
+    date_col_cache: Dict[tuple, tuple] = {}
+
+    def _date_col_info(sheet, col, sm):
+        key = (sheet, col)
+        if key not in date_col_cache:
+            dates = excel_reader.column_dates(
+                wb, sheet, col, header_row=sm.header_row,
+                date_formats=sm.date_formats or None, interpretation=interp)
+            parsed = [d for _, _, d in dates]
+            date_col_cache[key] = (set(parsed),
+                                   min(parsed) if parsed else None,
+                                   max(parsed) if parsed else None)
+        return date_col_cache[key]
 
     for agg in rows:
         item = PlanItem(
@@ -324,6 +338,23 @@ def build_plan(
 
             item.date_column = date_col
             if matched is None:
+                # Diagnose WHY it's missing using a full-column scan.
+                dset, mn, mx = _date_col_info(sheet, date_col, sm) if date_col else (set(), None, None)
+                in_range = (mn is not None and mn <= agg.date <= mx)
+
+                # If the exact date IS present in the column but find_row_by_date
+                # did not match it, that's a genuine bug — surface it as an error
+                # regardless of the missing-date behaviour.
+                if agg.date in dset:
+                    item.status = Status.ERROR
+                    item.messages.append(
+                        f"BUG: PDF date {item.pdf_date_normalised} exists in the Excel date "
+                        f"column but was not matched. Please report this."
+                    )
+                    report.errors += 1
+                    report.items.append(item)
+                    continue
+
                 action = config.write_rules.date_not_found_action
                 do_insert = (action in (DateNotFoundAction.INSERT_ROW, DateNotFoundAction.COPY_NEAREST)
                              or config.write_rules.insert_missing_date_rows)
@@ -348,11 +379,25 @@ def build_plan(
                         header_row=sm.header_row, date_formats=sm.date_formats or None,
                         interpretation=interp,
                     )
+                elif in_range:
+                    # Within the Excel date range but no exact row -> per the
+                    # spec, flag as an error so nothing is written until resolved.
+                    item.status = Status.ERROR
+                    item.messages.append(
+                        f"PDF date {item.pdf_date_normalised} is WITHIN the Excel date range "
+                        f"[{mn} .. {mx}] but no row has this exact date. Likely a missing row "
+                        f"or a date-format mismatch — resolve before writing."
+                    )
+                    report.errors += 1
+                    report.items.append(item)
+                    continue
                 else:
                     item.status = Status.DATE_NOT_FOUND
+                    rng = f"[{mn} .. {mx}]" if mn else "(no parseable dates)"
                     item.messages.append(
-                        "Matching date row not found in worksheet "
-                        f"(PDF date {item.pdf_date_normalised})."
+                        f"PDF date {item.pdf_date_normalised} is OUTSIDE the Excel date "
+                        f"range {rng} for this column — likely the wrong worksheet or "
+                        f"workbook year."
                     )
                     report.dates_not_found += 1
                     report.items.append(item)
@@ -425,13 +470,53 @@ def build_plan(
             if better:
                 sug_txt = " Suggested date column(s): " + ", ".join(
                     f"{letter} ({hdr or 'no header'}) matches {m}" for letter, hdr, m, _ in better)
+            # Include the Excel column's actual date range vs the PDF range so a
+            # "wrong year" workbook is obvious at a glance.
+            rng_txt = ""
+            date_col = excel_reader.resolve_column_index(
+                wb, sheet, mode=sm.date_target_mode.value,
+                selector=sm.date_column, header_row=sm.header_row) if sm else None
+            if date_col:
+                _, mn, mx = _date_col_info(sheet, date_col, sm)
+                pdf_min, pdf_max = (min(targets), max(targets)) if targets else (None, None)
+                if mn:
+                    rng_txt = (f" Excel date range here is [{mn} .. {mx}]; "
+                               f"PDF dates are [{pdf_min} .. {pdf_max}].")
             report.date_match_warnings.append(
                 f"Sheet '{sheet}': {missing} of {total} PDF dates were not found in the "
                 f"selected date column. This may mean the wrong date column, wrong worksheet, "
-                f"wrong workbook year, or missing date rows.{sug_txt}"
+                f"wrong workbook year, or missing date rows.{rng_txt}{sug_txt}"
             )
 
     return report
+
+
+def excel_date_debug_rows(wb, config: AppConfig) -> List[dict]:
+    """Row-by-row debug of the resolved date column for every mapped sheet.
+
+    Powers ``excel_date_debug.csv`` so the real stored value, data type and
+    number format of each date cell are visible (independent of display).
+    """
+    interp = config.source.date_interpretation or "dmy"
+    sheet_names = set(excel_reader.list_sheets(wb))
+    out: List[dict] = []
+    seen_sheets = set()
+    for sheet in config.group_to_sheet.values():
+        if not sheet or sheet in seen_sheets or sheet not in sheet_names:
+            continue
+        seen_sheets.add(sheet)
+        sm = config.sheets.get(sheet)
+        if sm is None:
+            continue
+        date_col = excel_reader.resolve_column_index(
+            wb, sheet, mode=sm.date_target_mode.value,
+            selector=sm.date_column, header_row=sm.header_row)
+        if not date_col:
+            continue
+        out.extend(excel_reader.date_column_debug(
+            wb, sheet, date_col, header_row=sm.header_row,
+            date_formats=sm.date_formats or None, interpretation=interp))
+    return out
 
 
 def _insert_position(wb, sheet, date_col, target_date, sm) -> int:

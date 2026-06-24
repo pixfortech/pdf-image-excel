@@ -209,36 +209,78 @@ def analyze_date_column(
     date_formats: Optional[Sequence[str]] = None,
     interpretation: str = "dmy",
 ) -> dict:
-    """Summarise how well a column's dates cover ``target_dates`` (a set of dates).
+    """Summarise how well a column's dates cover ``target_dates``.
 
-    Returns matched/missing counts, the parseable-date count, and the first few
-    parsed dates for display.
+    Scans the FULL column (not a preview window). Returns matched/missing counts,
+    the parseable-date count, the date set, min/max dates, and the first/last 10
+    parsed ``(raw, normalised)`` dates for display.
     """
     targets = set(d for d in target_dates if d is not None)
     found = set()
-    parsed_count = 0
-    sample = []
+    date_set = set()
+    parsed_list = []   # (raw, parsed) in row order
     ws = wb[sheet_name]
     for r in range(header_row + 1, ws.max_row + 1):
         val = ws.cell(row=r, column=col_index).value
         parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
         if parsed is None:
             continue
-        parsed_count += 1
-        if len(sample) < 10:
-            sample.append((val, parsed))
+        parsed_list.append((val, parsed))
+        date_set.add(parsed)
         if parsed in targets:
             found.add(parsed)
     matched = len(found)
     missing = len(targets) - matched
+    all_parsed = [p for _, p in parsed_list]
     return {
         "col_index": col_index,
-        "parsed_count": parsed_count,
+        "parsed_count": len(parsed_list),
         "matched": matched,
         "missing": missing,
         "total_targets": len(targets),
-        "sample": sample,
+        "date_set": date_set,
+        "min_date": min(all_parsed) if all_parsed else None,
+        "max_date": max(all_parsed) if all_parsed else None,
+        "first10": parsed_list[:10],
+        "last10": parsed_list[-10:],
+        "sample": parsed_list[:10],  # backwards compatibility
     }
+
+
+def date_column_debug(
+    wb,
+    sheet_name: str,
+    col_index: int,
+    *,
+    header_row: int = 1,
+    date_formats: Optional[Sequence[str]] = None,
+    interpretation: str = "dmy",
+) -> list:
+    """Row-by-row debug of a date column for the WHOLE column.
+
+    Returns dicts with: worksheet, row, cell, raw_cell_value, cell_data_type,
+    number_format, parsed_date, parse_status — so display formatting (e.g.
+    ``d-mmm`` showing ``04-Jan``) can be told apart from the real stored value.
+    """
+    ws = wb[sheet_name]
+    rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        cell = ws.cell(row=r, column=col_index)
+        val = cell.value
+        if val is None or (isinstance(val, str) and not val.strip()):
+            continue  # skip empty cells to keep the export focused
+        parsed = utils.parse_date(val, formats=date_formats, interpretation=interpretation)
+        rows.append({
+            "worksheet": sheet_name,
+            "row": r,
+            "cell": f"{get_column_letter(col_index)}{r}",
+            "raw_cell_value": val,
+            "cell_data_type": cell.data_type,        # 'd'=date, 'n'=number, 's'=string, 'f'=formula
+            "number_format": cell.number_format,
+            "parsed_date": parsed.isoformat() if parsed else "",
+            "parse_status": "ok" if parsed else "unparsed",
+        })
+    return rows
 
 
 def suggest_date_columns(
