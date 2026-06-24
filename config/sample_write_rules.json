@@ -1,0 +1,9 @@
+{
+  "_comment": "Example ONLY. These are safe defaults; choose your own in the UI.",
+  "write_action": "ask",
+  "output_type": "numeric",
+  "insert_missing_date_rows": false,
+  "date_not_found_action": "skip",
+  "add_source_comment": false,
+  "aggregation_keys": ["group", "date"]
+}

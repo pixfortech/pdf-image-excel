@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/
+*.xlsx~
+.venv/
+venv/
+.DS_Store
+scripts/_validation_out/
+scripts/_real_out/
