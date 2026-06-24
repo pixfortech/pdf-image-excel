@@ -519,6 +519,91 @@ def excel_date_debug_rows(wb, config: AppConfig) -> List[dict]:
     return out
 
 
+NO_RANGE_MESSAGE = "The selected worksheet does not contain the PDF date range."
+
+
+def date_diagnostics(wb, config: AppConfig, rows) -> List[dict]:
+    """Per-mapped-worksheet date diagnostic for the Page 7 panel.
+
+    For each worksheet that has at least one Customer Name mapped to it, returns:
+    worksheet, customers, selected date column, Excel min/max date (full scan),
+    first/last 10 parsed dates, the PDF date range for the customers mapped here,
+    matched/missing counts, and a plain-language status.
+    """
+    interp = config.source.date_interpretation or "dmy"
+    sheet_names = set(excel_reader.list_sheets(wb))
+
+    # Collect the PDF dates per target worksheet (only valid, normalised dates).
+    per_sheet: Dict[str, dict] = {}
+    for agg in rows:
+        if agg.date is None:
+            continue
+        sheet = config.group_to_sheet.get(agg.group, "")
+        if not sheet:
+            continue
+        d = per_sheet.setdefault(sheet, {"dates": set(), "groups": set()})
+        d["dates"].add(agg.date)
+        d["groups"].add(agg.group)
+
+    out: List[dict] = []
+    for sheet, info in per_sheet.items():
+        pdf_dates = info["dates"]
+        row = {
+            "worksheet": sheet,
+            "customers": sorted(info["groups"]),
+            "date_column": "",
+            "excel_min": None,
+            "excel_max": None,
+            "first10": [],
+            "last10": [],
+            "pdf_min": min(pdf_dates) if pdf_dates else None,
+            "pdf_max": max(pdf_dates) if pdf_dates else None,
+            "matched": 0,
+            "missing": len(pdf_dates),
+            "parsed_count": 0,
+            "status": "",
+        }
+        sm = config.sheets.get(sheet)
+        if sheet not in sheet_names:
+            row["status"] = f"Worksheet '{sheet}' not found in the uploaded workbook."
+            out.append(row); continue
+        if sm is None:
+            row["status"] = "No column mapping configured for this worksheet."
+            out.append(row); continue
+        date_col = excel_reader.resolve_column_index(
+            wb, sheet, mode=sm.date_target_mode.value,
+            selector=sm.date_column, header_row=sm.header_row)
+        row["date_column"] = sm.date_column
+        if not date_col:
+            row["status"] = f"Date column '{sm.date_column}' not found in '{sheet}'."
+            out.append(row); continue
+
+        an = excel_reader.analyze_date_column(
+            wb, sheet, date_col, pdf_dates, header_row=sm.header_row,
+            date_formats=sm.date_formats or None, interpretation=interp)
+        row.update({
+            "excel_min": an["min_date"], "excel_max": an["max_date"],
+            "first10": an["first10"], "last10": an["last10"],
+            "matched": an["matched"], "missing": an["missing"],
+            "parsed_count": an["parsed_count"],
+        })
+
+        covers = (an["min_date"] is not None and row["pdf_min"] is not None
+                  and an["min_date"] <= row["pdf_min"] and row["pdf_max"] <= an["max_date"])
+        if an["parsed_count"] == 0:
+            row["status"] = "No parseable dates found in the selected date column."
+        elif not covers:
+            row["status"] = NO_RANGE_MESSAGE
+        elif an["missing"] > 0:
+            # Worksheet covers the PDF range but some dates still unmatched -> bug.
+            row["status"] = ("BUG: worksheet covers the PDF date range but "
+                             f"{an['missing']} date(s) were not matched.")
+        else:
+            row["status"] = "OK"
+        out.append(row)
+    return out
+
+
 def _insert_position(wb, sheet, date_col, target_date, sm) -> int:
     """Choose a row index to insert at: keep dates sorted when possible."""
     ws = wb[sheet]

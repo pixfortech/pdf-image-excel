@@ -33,8 +33,10 @@ from src.mapping import (
     config_to_json,
 )
 from src.validator import (
-    Status, build_plan, configured_mapped_sheets, excel_date_debug_rows,
-    plan_to_export_rows, plan_to_write_ops, sheet_mapping_status,
+    NO_RANGE_MESSAGE as validator_no_range_msg,
+    Status, build_plan, configured_mapped_sheets, date_diagnostics,
+    excel_date_debug_rows, plan_to_export_rows, plan_to_write_ops,
+    sheet_mapping_status,
 )
 
 st.set_page_config(page_title="PDF/Image → Excel Mapper", layout="wide")
@@ -663,46 +665,54 @@ elif page == PAGES[6]:
                 st.warning(f"Sheet '{sh}' has duplicate headers: {', '.join(d)}")
 
         # Date-column analysis / suggestions (per mapped sheet).
-        with st.expander("🔎 Date matching analysis (selected column, samples, suggestions)"):
-            interp = CFG.source.date_interpretation
-            pdf_dates = sorted({it.date for it in report.items if it.date})
-            if pdf_dates:
-                st.caption(f"PDF date range: {pdf_dates[0]} → {pdf_dates[-1]} "
-                           f"({len(pdf_dates)} distinct dates). Interpretation: {interp}.")
-            for sheet in dict.fromkeys(CFG.group_to_sheet.values()):
-                sm = CFG.sheets.get(sheet)
-                if not sheet or sm is None or sheet not in excel_reader.list_sheets(wb):
-                    continue
-                date_col = excel_reader.resolve_column_index(
-                    wb, sheet, mode=sm.date_target_mode.value, selector=sm.date_column, header_row=sm.header_row)
-                st.markdown(f"**{sheet}** — selected date column: `{sm.date_column}`")
-                if date_col is None:
-                    st.write("Date column could not be resolved.")
-                    continue
-                info = excel_reader.analyze_date_column(
-                    wb, sheet, date_col, set(pdf_dates), header_row=sm.header_row,
-                    date_formats=sm.date_formats or None, interpretation=interp)
-                a, b = st.columns(2)
-                a.metric("Matched", f"{info['matched']} / {info['total_targets']}")
-                b.metric("Missing", info["missing"])
-                st.write(f"Excel date range (full column scan): **{info['min_date']} … "
-                         f"{info['max_date']}**  ·  parseable date cells: {info['parsed_count']}")
-                if pdf_dates and info["min_date"] and info["max_date"] \
-                        and info["min_date"] <= pdf_dates[0] and pdf_dates[-1] <= info["max_date"] \
-                        and info["missing"] > 0:
-                    st.error("PDF date range is inside the Excel date range, yet some dates were "
-                             "not matched — flagged as an error in the plan (missing rows or "
-                             "format mismatch).")
-                st.caption("First 10 parsed Excel dates (raw → normalised):")
-                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["first10"]])
-                st.caption("Last 10 parsed Excel dates (raw → normalised):")
-                st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in info["last10"]])
-                sugg = excel_reader.suggest_date_columns(
-                    wb, sheet, set(pdf_dates), header_row=sm.header_row,
-                    date_formats=sm.date_formats or None, interpretation=interp)
-                if sugg:
-                    st.write("Suggested date columns (by match count): "
-                             + ", ".join(f"{l} ({h or 'no header'}): {m} matched" for l, h, m, _ in sugg))
+        # ---- Per-mapped-worksheet date diagnostic (always visible) ----
+        st.subheader("📅 Date matching diagnostic (per mapped worksheet)")
+        diags = date_diagnostics(wb, CFG, rows)
+        if not diags:
+            st.info("No worksheet has both a Customer Name mapping and parseable PDF dates yet.")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "Worksheet": d["worksheet"],
+                "Customer(s)": ", ".join(d["customers"]),
+                "Date column": d["date_column"],
+                "Excel min date": d["excel_min"],
+                "Excel max date": d["excel_max"],
+                "PDF min date": d["pdf_min"],
+                "PDF max date": d["pdf_max"],
+                "Matched": d["matched"],
+                "Missing": d["missing"],
+                "Status": d["status"],
+            } for d in diags]), use_container_width=True)
+
+            for d in diags:
+                if d["status"] == validator_no_range_msg:
+                    st.warning(f"**{d['worksheet']}**: {validator_no_range_msg} "
+                               f"(Excel {d['excel_min']}…{d['excel_max']} vs PDF {d['pdf_min']}…{d['pdf_max']}). "
+                               "Upload a workbook whose worksheet contains these dates, or check the date column.")
+                elif d["status"].startswith("BUG"):
+                    st.error(f"**{d['worksheet']}**: {d['status']}")
+
+            with st.expander("First/last 10 parsed Excel dates per worksheet, and column suggestions"):
+                interp = CFG.source.date_interpretation
+                for d in diags:
+                    st.markdown(f"**{d['worksheet']}** — date column `{d['date_column']}` · "
+                                f"parseable date cells: {d['parsed_count']}")
+                    st.caption("First 10 (raw → normalised):")
+                    st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in d["first10"]])
+                    st.caption("Last 10 (raw → normalised):")
+                    st.write([f"{raw!r} → {norm.isoformat()}" for raw, norm in d["last10"]])
+                    if d["missing"] > 0 and d["worksheet"] in excel_reader.list_sheets(wb):
+                        sm = CFG.sheets.get(d["worksheet"])
+                        if sm:
+                            pdfset = {it.date for it in report.items
+                                      if it.sheet == d["worksheet"] and it.date}
+                            sugg = excel_reader.suggest_date_columns(
+                                wb, d["worksheet"], pdfset, header_row=sm.header_row,
+                                date_formats=sm.date_formats or None, interpretation=interp)
+                            if sugg:
+                                st.write("Suggested date columns (by match count): "
+                                         + ", ".join(f"{l} ({h or 'no header'}): {m} matched"
+                                                     for l, h, m, _ in sugg))
 
             # Debug export: real stored value / data type / number format per cell.
             debug_rows = excel_date_debug_rows(wb, CFG)

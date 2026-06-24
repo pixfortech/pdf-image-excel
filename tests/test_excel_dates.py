@@ -110,6 +110,96 @@ def test_in_range_but_missing_is_flagged_error():
     assert report.has_blocking_errors
 
 
+def _wb_two_branches(year=2026):
+    """Two branch sheets BN and BD, each DATE/CHALLAN columns, real dates."""
+    wb = openpyxl.Workbook()
+    bn = wb.active; bn.title = "BN"
+    bd = wb.create_sheet("BD")
+    other = wb.create_sheet("Consolidated")
+    for ws in (bn, bd):
+        ws.append(["DATE", "CHALLAN"])
+        for d in (dt.date(year, 5, 15), dt.date(year, 5, 16)):
+            c = ws.cell(row=ws.max_row + 1, column=1, value=dt.datetime(d.year, d.month, d.day))
+            c.number_format = "d-mmm"
+            ws.cell(row=c.row, column=2, value=None)
+    other.append(["DATE", "BN", "BD"])
+    other.append([dt.datetime(year, 5, 15), None, None])
+    buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+
+def _records_two():
+    text = """\
+Customer Name: BARANAGAR
+A1   15/05/2026   100.00
+Customer Name: BEADON STREET
+B1   15/05/2026   200.00
+"""
+    return parse_text_lines([text], group_label="Customer Name",
+                            field_names=["Inv No", "Inv Date", "Amount"])
+
+
+def _cfg_two():
+    return AppConfig(
+        source=SourceMapping(date_field="Inv Date", amount_field="Amount",
+                             sum_duplicate_dates=True, date_interpretation="dmy"),
+        group_to_sheet={"BARANAGAR": "BN", "BEADON STREET": "BD"},
+        sheets={
+            "BN": SheetMapping(sheet_name="BN", header_row=1,
+                               date_target_mode=TargetMode.COLUMN_LETTER, date_column="A",
+                               amount_target_mode=TargetMode.COLUMN_LETTER, amount_column="B"),
+            "BD": SheetMapping(sheet_name="BD", header_row=1,
+                               date_target_mode=TargetMode.COLUMN_LETTER, date_column="A",
+                               amount_target_mode=TargetMode.COLUMN_LETTER, amount_column="B"),
+        },
+        write_rules=WriteRules(write_action=WriteAction.REPLACE, aggregation_keys=["group", "date"]),
+    )
+
+
+def test_sheet_per_group_writes_only_to_assigned_sheet():
+    from src.excel_writer import apply_writes
+    from src.validator import plan_to_write_ops
+    data = _wb_two_branches(2026)
+    cfg = _cfg_two()
+    rows = aggregate(_records_two(), cfg.source, aggregation_keys=["group", "date"])
+    report = build_plan(excel_reader.open_workbook(data), rows, cfg)
+    bn_item = [i for i in report.items if i.group == "BARANAGAR"][0]
+    bd_item = [i for i in report.items if i.group == "BEADON STREET"][0]
+    assert bn_item.sheet == "BN" and bn_item.status == Status.READY
+    assert bd_item.sheet == "BD" and bd_item.status == Status.READY
+
+    out, _ = apply_writes(data, plan_to_write_ops(report, cfg))
+    ow = openpyxl.load_workbook(io.BytesIO(out))
+    # Each customer's value landed only in its own sheet at the matched row.
+    assert ow["BN"].cell(row=bn_item.matched_row, column=2).value == 100.0
+    assert ow["BD"].cell(row=bd_item.matched_row, column=2).value == 200.0
+    # Consolidated must be untouched.
+    assert ow["Consolidated"]["B2"].value is None
+    assert ow["Consolidated"]["C2"].value is None
+
+
+def test_date_diagnostics_ok_per_sheet():
+    from src.validator import date_diagnostics
+    data = _wb_two_branches(2026)
+    cfg = _cfg_two()
+    rows = aggregate(_records_two(), cfg.source, aggregation_keys=["group", "date"])
+    diags = {d["worksheet"]: d for d in date_diagnostics(excel_reader.open_workbook(data), cfg, rows)}
+    assert diags["BN"]["status"] == "OK"
+    assert diags["BN"]["customers"] == ["BARANAGAR"]
+    assert diags["BN"]["excel_min"] == dt.date(2026, 5, 15)
+    assert diags["BD"]["customers"] == ["BEADON STREET"]
+    assert diags["BN"]["matched"] == 1 and diags["BN"]["missing"] == 0
+
+
+def test_date_diagnostics_no_range_message_for_old_workbook():
+    from src.validator import date_diagnostics, NO_RANGE_MESSAGE
+    data = _wb_two_branches(2021)   # workbook has 2021 dates, PDF is 2026
+    cfg = _cfg_two()
+    rows = aggregate(_records_two(), cfg.source, aggregation_keys=["group", "date"])
+    diags = {d["worksheet"]: d for d in date_diagnostics(excel_reader.open_workbook(data), cfg, rows)}
+    assert diags["BN"]["status"] == NO_RANGE_MESSAGE
+    assert diags["BD"]["status"] == NO_RANGE_MESSAGE
+
+
 def test_excel_date_debug_export_shows_real_values():
     data, row = _wb_with_format("d-mmm")
     cfg = _config()

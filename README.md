@@ -117,7 +117,21 @@ formatting.** A cell formatted `d-mmm` shows `04-Jan` but stores a real
 from the value, not the display. The full date column is scanned (not just a
 preview window).
 
-Page 7 shows a date-matching analysis per mapped sheet: selected date column,
+The default mapping mode is **sheet-per-group**: each PDF Customer Name maps to
+its own worksheet, the date is matched in that worksheet's DATE column, and the
+amount (and optional return) is written only into that worksheet's assigned
+column. Customers are never redirected to a consolidated/matrix sheet unless you
+explicitly map them there.
+
+Page 7 shows a **per-mapped-worksheet date diagnostic** (always visible):
+worksheet, customer(s) mapped to it, selected date column, the Excel min/max
+date (full-column scan), the PDF date range for that worksheet's customers, and
+matched / missing counts. If the worksheet's dates do not cover the PDF range it
+shows *"The selected worksheet does not contain the PDF date range."*; if the
+worksheet **does** cover the range but a date still cannot be matched, it is
+treated as a **bug** and flagged as an error.
+
+Page 7 also shows a date-matching analysis per mapped sheet: selected date column,
 the **first 10 and last 10** parsed Excel dates (raw → normalised), the
 **minimum and maximum** Excel date (full-column scan), the PDF date range,
 matched / missing counts, and **suggested alternative date columns**. A
