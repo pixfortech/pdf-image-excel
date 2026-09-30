@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.streamlit/
+*.xlsx~
+.venv/
+venv/
+.DS_Store
+scripts/_validation_out/
+scripts/_real_out/
+
+# Local real-file fixtures, outputs and expectations (never commit business data)
+local/
+.pdf-image-excel/
