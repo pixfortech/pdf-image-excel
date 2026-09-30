@@ -1,0 +1,42 @@
+{
+  "profile_version": 2,
+  "profile_name": "Example grouped sales report",
+  "source": {
+    "group_label": "Group Name",
+    "columns": ["Ref No", "Doc Date", "Total Amount", "Returns"],
+    "date_field": "Doc Date",
+    "amount_field": "Total Amount",
+    "returns_field": "Returns",
+    "reference_field": "Ref No",
+    "group_total_label": "Group Total",
+    "date_order": "dmy"
+  },
+  "group_to_sheet": {
+    "EXAMPLE GROUP ONE": "SHEET1",
+    "EXAMPLE GROUP TWO": "SHEET2"
+  },
+  "ignored_groups": [],
+  "sheet_template": {
+    "header_row": 1,
+    "date": {"letter": "A", "header": "DATE"},
+    "amount": {"letter": "B", "header": "SALES"},
+    "returns": {"letter": "C", "header": "RETURN"}
+  },
+  "sheet_overrides": {
+    "SHEET2": {
+      "header_row": 1,
+      "date": {"letter": "A", "header": "DATE"},
+      "amount": {"letter": "C", "header": "SALES"},
+      "returns": {"letter": "", "header": ""}
+    }
+  },
+  "write": {
+    "output_mode": "numeric",
+    "existing_values": "overwrite",
+    "write_returns": true,
+    "zero_fill_returns": false
+  },
+  "created": "",
+  "updated": "",
+  "last_success": ""
+}

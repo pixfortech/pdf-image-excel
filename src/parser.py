@@ -1,343 +1,537 @@
-"""Line-based and structure-aware parsing of extracted document content.
+"""Layout-aware parsing of grouped reports into semantic invoice rows.
 
-This module turns raw extracted pages (text and/or detected tables) into a flat
-list of structured records.  It detects "group" sections (e.g. a line such as
-``Customer Name: SOMETHING``) and assigns subsequent data rows to the most
-recent group, carrying the active group across page breaks.
+The report shape this handles (and which a saved profile describes) is:
 
-Crucially nothing here is tied to a particular label, customer, column, date
-format or amount style.  Group labels are auto-detected as *candidates* and the
-final choice is left to the user via configuration.
+    <preamble: title, "From Date: .. To Date: ..">
+    <Group Label>: <group name>              e.g. "Customer Name: NORTH MARKET"
+    <column header line>                     e.g. "InvNo InvDate Total Amount Returns"
+    <data rows>                              continue across pages until the next group
+    <group total label> : <amount(s)>        e.g. "Customer Total : 1,23,456.00"
+    ...
+    <grand total label> : <amount>           e.g. "Total : 9,87,654.00"
+
+Columns are identified by the header's POSITION on the page (ruled header
+cells when present, otherwise word gaps), and data words are assigned to the
+column they sit under.  Fields therefore carry their printed header label
+("Inv Date", "Total Amount") — never a token index — so a blank Returns cell
+cannot shift an amount into the wrong field, and an invoice number cannot land
+in the date field.  Printed totals are not data: they are kept to reconcile
+the extracted invoices.  Nothing here knows any customer, branch or sheet name.
 """
 from __future__ import annotations
 
+import datetime as _dt
+import math
 import re
+import statistics
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import utils
+from . import values
+from .extractor import Document, Page, Word
+
+_TOLERANCE = 0.005  # money reconciliation tolerance
+_MIN_TYPE_SHARE = 0.9
 
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Result types
 # ---------------------------------------------------------------------------
 
 @dataclass
-class Record:
-    """One detected data row plus all its provenance."""
+class Line:
     page: int
-    group: str                       # detected group/customer/branch name
-    fields: Dict[str, str] = field(default_factory=dict)  # detected field -> value
-    source_text: str = ""
-    ocr_confidence: Optional[float] = None
-    status: str = "ok"
+    words: List[Word]
+
+    @property
+    def text(self) -> str:
+        return " ".join(w.text for w in self.words)
+
+    @property
+    def yc(self) -> float:
+        return sum(w.yc for w in self.words) / len(self.words)
+
+
+@dataclass
+class Column:
+    label: str
+    lo: float
+    hi: float
+
+    @property
+    def key(self) -> str:
+        return values.label_key(self.label)
+
+
+@dataclass
+class SourceRow:
+    """A line inside a group, split into columns (not yet validated)."""
+    group: str
+    page: int
+    values: Dict[str, str]
+    text: str
+
+
+@dataclass
+class Summary:
+    """A printed total line: label followed only by amounts."""
+    label: str
+    amounts: List[float]
+    page: int
+    text: str
+    group: Optional[str]
+
+
+@dataclass
+class IgnoredLine:
+    page: int
+    text: str
+    reason: str
+
+
+@dataclass
+class ColumnStats:
+    label: str
+    non_empty: int = 0
+    dates: int = 0
+    amounts: int = 0
+
+    @property
+    def kind(self) -> str:
+        if self.non_empty == 0:
+            return "empty"
+        if self.dates / self.non_empty >= _MIN_TYPE_SHARE:
+            return "date"
+        if self.amounts / self.non_empty >= _MIN_TYPE_SHARE:
+            return "amount"
+        return "text"
+
+
+@dataclass
+class ParsedReport:
+    group_label: str = ""
+    columns: List[str] = field(default_factory=list)
+    groups: List[str] = field(default_factory=list)
+    rows: List[SourceRow] = field(default_factory=list)
+    group_total_label: str = ""
+    group_totals: Dict[str, List[Summary]] = field(default_factory=dict)
+    grand_total: Optional[Summary] = None
+    period: Optional[Tuple[_dt.date, Optional[_dt.date]]] = None
+    date_order: str = values.DMY
+    column_stats: Dict[str, ColumnStats] = field(default_factory=dict)
+    ignored: List[IgnoredLine] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
-    ignored: bool = False
-    row_index: int = -1              # stable index assigned at parse time
+
+    def column_kind(self, label: str) -> str:
+        key = values.label_key(label)
+        for name, stats in self.column_stats.items():
+            if values.label_key(name) == key:
+                return stats.kind
+        return "missing"
+
+    def has_column(self, label: str) -> bool:
+        key = values.label_key(label)
+        return any(values.label_key(c) == key for c in self.columns)
 
 
-# A line that looks like ``<label>: <value>`` is a candidate group marker.
-_GROUP_MARKER_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9 ._/&-]{1,40}?)\s*[:\-]\s*(.+?)\s*$")
+@dataclass
+class Invoice:
+    group: str
+    date: _dt.date
+    amount: Optional[float]
+    returns: Optional[float]
+    reference: str
+    page: int
+    text: str
 
-# Tokens that very commonly identify a *label* (left-hand side) introducing a
-# group.  We only use these to *rank* auto-detected candidates, never to force
-# a choice; the user always decides.
-_GROUP_LABEL_HINTS = (
-    "customer", "branch", "party", "account", "ledger", "name", "client",
-    "vendor", "supplier", "dealer", "group", "shop", "outlet",
-)
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+def parse(
+    doc: Document,
+    *,
+    group_label: str = "",
+    header_labels: Sequence[str] = (),
+    group_total_label: str = "",
+    date_order: str = values.DMY,
+) -> ParsedReport:
+    """Parse ``doc``.  Labels come from a saved profile when known; otherwise
+    they are detected from the document's structure."""
+    report = ParsedReport()
+    pages = [(page, _lines(page)) for page in doc.pages]
+    all_lines = [line for _, lines in pages for line in lines]
+
+    header_key = values.label_key(" ".join(header_labels)) if header_labels else ""
+    if not header_key or not any(values.label_key(l.text) == header_key for l in all_lines):
+        if header_key:
+            report.warnings.append(
+                "The saved column header was not found; the header was re-detected from this document.")
+        header_key = _detect_header_key(all_lines)
+    report.group_label = group_label or _detect_group_label(all_lines, header_key)
+    group_key = values.label_key(report.group_label)
+
+    group: Optional[str] = None
+    columns: Optional[List[Column]] = None
+    summaries: List[Summary] = []
+    preamble: List[Line] = []
+
+    for page, lines in pages:
+        for line in lines:
+            if header_key and values.label_key(line.text) == header_key:
+                columns = _columns_for(line, page, header_labels)
+                if not report.columns:
+                    report.columns = [c.label for c in columns]
+                continue
+            label_value = _label_value(line.text)
+            if label_value and group_key and values.label_key(label_value[0]) == group_key:
+                group = label_value[1]
+                if group not in report.groups:
+                    report.groups.append(group)
+                continue
+            summary = _summary(line, group)
+            if summary:
+                summaries.append(summary)
+                continue
+            if group is None:
+                preamble.append(line)
+                report.ignored.append(IgnoredLine(line.page, line.text, "before the first group"))
+                continue
+            if columns is None:
+                report.ignored.append(IgnoredLine(line.page, line.text, "no column header yet"))
+                continue
+            report.rows.append(SourceRow(group, line.page, _assign(line, columns), line.text))
+
+    if not report.groups:
+        report.warnings.append("No groups were detected (group label not found).")
+    if not report.columns:
+        report.warnings.append("No column header line was detected.")
+
+    report.period = _period(preamble)
+    report.date_order = _resolve_order(date_order, report.rows)
+    report.column_stats = _column_stats(report)
+    _classify_summaries(report, summaries, group_total_label)
+    return report
 
 
-def looks_like_group_marker(line: str, group_label: str = "") -> Optional[tuple]:
-    """Return ``(label, value)`` if *line* introduces a group, else ``None``.
+def _lines(page: Page) -> List[Line]:
+    """Cluster words into visual lines by vertical centre."""
+    lines: List[Line] = []
+    for word in sorted(page.words, key=lambda w: (w.yc, w.x0)):
+        if lines and abs(word.yc - lines[-1].yc) <= 0.5 * max(word.height, lines[-1].words[0].height):
+            lines[-1].words.append(word)
+        else:
+            lines.append(Line(page.number, [word]))
+    for line in lines:
+        line.words.sort(key=lambda w: w.x0)
+    return lines
 
-    When ``group_label`` is provided, the label must match it (case-insensitive,
-    ignoring surrounding spaces).  Otherwise any ``label: value`` pattern whose
-    label looks like a name field is accepted.
-    """
-    m = _GROUP_MARKER_RE.match(line)
-    if not m:
+
+_LABEL_VALUE_RE = re.compile(r"^\s*([A-Za-z][A-Za-z .]*?)\s*:\s*(.*?)\s*$")
+
+
+def _label_value(text: str) -> Optional[Tuple[str, str]]:
+    m = _LABEL_VALUE_RE.match(text)
+    return (m.group(1).strip(), m.group(2).strip()) if m else None
+
+
+def _summary(line: Line, group: Optional[str]) -> Optional[Summary]:
+    """``<letters label> [:] <amount> [<amount> ...]`` — a printed total."""
+    words = [w.text for w in line.words]
+    label_words = []
+    i = 0
+    while i < len(words) and re.fullmatch(r"[A-Za-z][A-Za-z.]*:?", words[i]):
+        label_words.append(words[i].rstrip(":"))
+        i += 1
+    if i < len(words) and words[i] == ":":
+        i += 1
+    amounts = [values.parse_amount(w) for w in words[i:]]
+    if not label_words or not amounts or any(a is None for a in amounts) or len(amounts) > 3:
         return None
-    label, value = m.group(1).strip(), m.group(2).strip()
-    if not value:
-        return None
-    if group_label:
-        if label.lower().strip() == group_label.lower().strip():
-            return label, value
-        return None
-    # Auto mode: accept if the label resembles a known grouping label hint.
-    low = label.lower()
-    if any(hint in low for hint in _GROUP_LABEL_HINTS):
-        return label, value
+    return Summary(" ".join(label_words), amounts, line.page, line.text, group)
+
+
+def _is_header_like(line: Line) -> bool:
+    return (len(line.words) >= 2 and ":" not in line.text
+            and all(re.search(r"[A-Za-z]", w.text) and not re.search(r"\d", w.text)
+                    for w in line.words))
+
+
+def _detect_header_key(lines: List[Line]) -> str:
+    """The header is the header-like line most often followed by a data line
+    (a line containing a date that is not a ``label: value`` line)."""
+    scores: Dict[str, int] = {}
+    for i, line in enumerate(lines):
+        if not _is_header_like(line):
+            continue
+        nxt = lines[i + 1] if i + 1 < len(lines) else None
+        if nxt and nxt.page == line.page and not _label_value(nxt.text) \
+                and any(values.is_date(w.text) for w in nxt.words):
+            key = values.label_key(line.text)
+            scores[key] = scores.get(key, 0) + 1
+    return max(scores, key=lambda k: scores[k]) if scores else ""
+
+
+def _detect_group_label(lines: List[Line], header_key: str) -> str:
+    """The group label is the ``label: value`` line that most often
+    introduces a column header (e.g. ``Customer Name: X`` above the header)."""
+    counts: Dict[str, List[str]] = {}
+    for i, line in enumerate(lines):
+        lv = _label_value(line.text)
+        if not lv or not lv[1] or values.is_amount(lv[1]):
+            continue
+        following = lines[i + 1:i + 3]
+        if any(values.label_key(f.text) == header_key for f in following):
+            counts.setdefault(values.label_key(lv[0]), []).append(lv[0])
+    if not counts:
+        return ""
+    best = max(counts, key=lambda k: len(counts[k]))
+    return statistics.mode(counts[best])
+
+
+def _columns_for(line: Line, page: Page, header_labels: Sequence[str]) -> List[Column]:
+    ruled = _ruled_columns(line, page)
+    if ruled:
+        return ruled
+    groups = _group_by_labels(line.words, header_labels) or _group_by_gaps(line.words)
+    spans = [(" ".join(w.text for w in g), g[0].x0, g[-1].x1) for g in groups]
+    columns = []
+    for i, (label, x0, x1) in enumerate(spans):
+        lo = -math.inf if i == 0 else (spans[i - 1][2] + x0) / 2
+        hi = math.inf if i == len(spans) - 1 else (x1 + spans[i + 1][1]) / 2
+        columns.append(Column(label, lo, hi))
+    return columns
+
+
+def _ruled_columns(line: Line, page: Page) -> Optional[List[Column]]:
+    """Use the boxed header cells drawn in the PDF when they line up."""
+    for row in page.ruled_rows:
+        top, bottom = min(b[1] for b in row), max(b[3] for b in row)
+        if not (top - 2 <= line.yc <= bottom + 2):
+            continue
+        columns, used = [], 0
+        for x0, _t, x1, _b in sorted(row, key=lambda b: b[0]):
+            inside = [w for w in line.words if x0 <= w.xc <= x1]
+            used += len(inside)
+            if inside:
+                columns.append(Column(" ".join(w.text for w in inside), x0, x1))
+        if used == len(line.words) and len(columns) >= 2:
+            return columns
     return None
 
 
-def detect_group_label_candidates(pages_text: Sequence[str]) -> List[str]:
-    """Scan text and return candidate group-label strings, most frequent first."""
-    counts: Dict[str, int] = {}
-    for text in pages_text:
-        for line in (text or "").splitlines():
-            m = _GROUP_MARKER_RE.match(line)
-            if not m:
-                continue
-            label = m.group(1).strip()
-            low = label.lower()
-            if any(hint in low for hint in _GROUP_LABEL_HINTS):
-                counts[label] = counts.get(label, 0) + 1
-    return [lbl for lbl, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
-
-
-# ---------------------------------------------------------------------------
-# Header / footer / total detection
-# ---------------------------------------------------------------------------
-
-def _is_repeated_header(cells: Sequence[str], header_cells: Optional[Sequence[str]]) -> bool:
-    if not header_cells:
-        return False
-    norm = [utils.normalise_whitespace(str(c)).lower() for c in cells]
-    hnorm = [utils.normalise_whitespace(str(c)).lower() for c in header_cells]
-    # Consider it a repeated header if the majority of non-empty cells match.
-    matches = sum(1 for c in norm if c and c in hnorm)
-    nonempty = sum(1 for c in norm if c)
-    return nonempty > 0 and matches >= max(2, nonempty - 1)
-
-
-def is_total_like(text: str, total_tokens: Optional[Sequence[str]] = None) -> bool:
-    """Heuristically decide whether a line is a subtotal/total line.
-
-    ``total_tokens`` may be supplied by configuration; when omitted a small set
-    of generic words is used purely as a heuristic (still user-overridable).
-    """
-    tokens = total_tokens if total_tokens is not None else ("total", "subtotal", "grand total", "sum")
-    low = utils.normalise_whitespace(text).lower()
-    return any(low.startswith(t) or f" {t}" in f" {low}" for t in tokens) and not re.search(r"[A-Za-z]{2,}\d", low)
-
-
-# ---------------------------------------------------------------------------
-# Table-based parsing
-# ---------------------------------------------------------------------------
-
-def parse_tables(
-    tables: Sequence[dict],
-    *,
-    group_label: str = "",
-    total_tokens: Optional[Sequence[str]] = None,
-) -> List[Record]:
-    """Parse a list of detected tables into records.
-
-    Each ``table`` is a dict with keys: ``page`` (int), ``rows`` (list of list of
-    str), and optionally ``ocr_confidence``.  The first non-empty row of the
-    first table that has repeated structure is treated as the header; repeated
-    headers on later pages are skipped.  The active group carries across tables
-    and pages until a new group marker appears.
-    """
-    records: List[Record] = []
-    header: Optional[List[str]] = None
-    active_group = ""
-    idx = 0
-
-    for table in tables:
-        page = table.get("page", 0)
-        rows = table.get("rows", [])
-        conf = table.get("ocr_confidence")
-        for raw in rows:
-            cells = ["" if c is None else str(c).strip() for c in raw]
-            joined = " ".join(c for c in cells if c)
-            if not joined.strip():
-                continue
-
-            # A single populated cell may be a group marker line.
-            marker = looks_like_group_marker(joined, group_label)
-            if marker:
-                active_group = marker[1]
-                continue
-
-            # Establish header from the first structured row we encounter.
-            if header is None:
-                header = [c if c else f"col_{i}" for i, c in enumerate(cells)]
-                continue
-
-            if _is_repeated_header(cells, header):
-                continue
-            if is_total_like(joined, total_tokens):
-                rec = _make_record(page, active_group, header, cells, joined, conf, idx)
-                rec.ignored = True
-                rec.status = "total"
-                rec.warnings.append("Detected as total/subtotal line")
-                records.append(rec)
-                idx += 1
-                continue
-
-            # Skip rows before the first group marker when a group is expected.
-            if group_label and not active_group:
-                continue
-
-            rec = _make_record(page, active_group, header, cells, joined, conf, idx)
-            records.append(rec)
-            idx += 1
-
-    return records
-
-
-def _make_record(page, group, header, cells, joined, conf, idx) -> Record:
-    fields: Dict[str, str] = {}
-    for i, name in enumerate(header):
-        fields[name] = cells[i] if i < len(cells) else ""
-    rec = Record(
-        page=page,
-        group=group,
-        fields=fields,
-        source_text=joined,
-        ocr_confidence=conf,
-        row_index=idx,
-    )
-    if not group:
-        rec.warnings.append("Row has no detected group yet")
-    return rec
-
-
-# ---------------------------------------------------------------------------
-# Free-text line parsing (fallback)
-# ---------------------------------------------------------------------------
-
-def parse_text_lines(
-    pages_text: Sequence[str],
-    *,
-    group_label: str = "",
-    row_regex: Optional[str] = None,
-    field_names: Optional[Sequence[str]] = None,
-    total_tokens: Optional[Sequence[str]] = None,
-) -> List[Record]:
-    """Parse plain text pages line by line.
-
-    When ``row_regex`` is supplied it is used (with named or positional groups)
-    to extract fields from each data line.  Otherwise rows are split on runs of
-    whitespace and assigned generic ``col_N`` names.  Group markers switch the
-    active group and carry across pages.
-    """
-    records: List[Record] = []
-    active_group = ""
-    idx = 0
-    compiled = re.compile(row_regex) if row_regex else None
-
-    for page_no, text in enumerate(pages_text, start=1):
-        for line in (text or "").splitlines():
-            if not line.strip():
-                continue
-            marker = looks_like_group_marker(line, group_label)
-            if marker:
-                active_group = marker[1]
-                continue
-            if is_total_like(line, total_tokens):
-                rec = Record(
-                    page=page_no, group=active_group,
-                    fields={}, source_text=line.strip(),
-                    status="total", ignored=True, row_index=idx,
-                    warnings=["Detected as total/subtotal line"],
-                )
-                records.append(rec)
-                idx += 1
-                continue
-
-            # Ignore any "preamble" lines that appear before the first group
-            # marker (report title, From Date / To Date, etc.) when a group
-            # label is expected.  These must not enter the write plan.
-            if group_label and not active_group:
-                continue
-
-            fields = _extract_line_fields(line, compiled, field_names)
-            if fields is None:
-                continue
-            rec = Record(
-                page=page_no, group=active_group,
-                fields=fields, source_text=line.strip(), row_index=idx,
-            )
-            if not active_group:
-                rec.warnings.append("Row has no detected group yet")
-            records.append(rec)
-            idx += 1
-    return records
-
-
-def _extract_line_fields(line, compiled, field_names) -> Optional[Dict[str, str]]:
-    if compiled is not None:
-        m = compiled.search(line)
-        if not m:
-            return None
-        gd = m.groupdict()
-        if gd:
-            return {k: (v or "").strip() for k, v in gd.items()}
-        return {f"col_{i}": (g or "").strip() for i, g in enumerate(m.groups())}
-
-    # Default: split on 2+ spaces (typical of fixed-width report exports),
-    # falling back to single spaces.
-    parts = re.split(r"\s{2,}", line.strip())
-    if len(parts) < 2:
-        parts = line.strip().split()
-    if len(parts) < 2:
+def _group_by_labels(words: List[Word], labels: Sequence[str]) -> Optional[List[List[Word]]]:
+    """Group header words so they spell the saved profile's column labels."""
+    if not labels:
         return None
-    if field_names:
-        return {
-            (field_names[i] if i < len(field_names) else f"col_{i}"): p.strip()
-            for i, p in enumerate(parts)
-        }
-    return {f"col_{i}": p.strip() for i, p in enumerate(parts)}
+    groups, i = [], 0
+    for label in labels:
+        target, current = values.label_key(label), []
+        while i < len(words) and len(values.label_key("".join(w.text for w in current))) < len(target):
+            current.append(words[i])
+            i += 1
+        if values.label_key("".join(w.text for w in current)) != target:
+            return None
+        groups.append(current)
+    return groups if i == len(words) else None
+
+
+def _group_by_gaps(words: List[Word]) -> List[List[Word]]:
+    """Words separated by roughly one space belong to the same header label."""
+    groups = [[words[0]]]
+    for prev, word in zip(words, words[1:]):
+        if word.x0 - prev.x1 < 0.5 * max(prev.height, word.height):
+            groups[-1].append(word)
+        else:
+            groups.append([word])
+    return groups
+
+
+def _assign(line: Line, columns: List[Column]) -> Dict[str, str]:
+    cells: Dict[str, List[str]] = {c.label: [] for c in columns}
+    for word in line.words:
+        inside = [c for c in columns if c.lo <= word.xc <= c.hi]
+        column = inside[0] if inside else min(
+            columns, key=lambda c: min(abs(word.xc - c.lo), abs(word.xc - c.hi)))
+        cells[column.label].append(word.text)
+    return {label: " ".join(parts) for label, parts in cells.items()}
+
+
+def _period(preamble: List[Line]) -> Optional[Tuple[_dt.date, Optional[_dt.date]]]:
+    for line in preamble:
+        dates = [d for d in (values.parse_date(w.text) for w in line.words) if d]
+        if len(dates) == 2:
+            return min(dates), max(dates)
+        if len(dates) == 1:
+            return dates[0], None
+    return None
+
+
+def _resolve_order(order: str, rows: List[SourceRow]) -> str:
+    if order != values.AUTO:
+        return order
+    return values.detect_date_order(v for r in rows for v in r.values.values())
+
+
+def _column_stats(report: ParsedReport) -> Dict[str, ColumnStats]:
+    """Type each column from data-like rows (rows containing a date)."""
+    stats = {label: ColumnStats(label) for label in report.columns}
+    for row in report.rows:
+        if not any(values.parse_date(v, report.date_order) for v in row.values.values()):
+            continue
+        for label, text in row.values.items():
+            s = stats.setdefault(label, ColumnStats(label))
+            if not text.strip():
+                continue
+            s.non_empty += 1
+            s.dates += values.parse_date(text, report.date_order) is not None
+            s.amounts += values.is_amount(text)
+    return stats
+
+
+def _classify_summaries(report: ParsedReport, summaries: List[Summary], group_total_label: str) -> None:
+    if not summaries:
+        return
+    counts: Dict[str, int] = {}
+    for s in summaries:
+        counts[values.label_key(s.label)] = counts.get(values.label_key(s.label), 0) + 1
+    if group_total_label:
+        gt_key = values.label_key(group_total_label)
+    else:
+        first_seen = {}
+        for i, s in enumerate(summaries):
+            first_seen.setdefault(values.label_key(s.label), i)
+        gt_key = max(counts, key=lambda k: (counts[k], -first_seen[k])) if report.groups else ""
+    for s in summaries:
+        if gt_key and values.label_key(s.label) == gt_key and s.group:
+            report.group_totals.setdefault(s.group, []).append(s)
+            report.group_total_label = report.group_total_label or s.label
+    others = [s for s in summaries if values.label_key(s.label) != gt_key]
+    if others:
+        report.grand_total = others[-1]
+        for s in others[:-1]:
+            report.ignored.append(IgnoredLine(s.page, s.text, "unclassified total line"))
 
 
 # ---------------------------------------------------------------------------
-# Helpers for the UI
+# Semantic validation: only genuine invoice rows enter the pipeline
 # ---------------------------------------------------------------------------
 
-def smart_parse(
-    tables: Sequence[dict],
-    pages_text: Sequence[str],
+def invoices(
+    report: ParsedReport,
     *,
-    group_label: str = "",
-    preferred: str = "tables",
-    row_regex: Optional[str] = None,
-    total_tokens: Optional[Sequence[str]] = None,
-):
-    """Parse with the preferred strategy, auto-switching when it loses groups.
-
-    Returns ``(records, mode_used, switched)``.
-
-    ``preferred`` is ``"tables"``, ``"text"`` or ``"regex"``.  When the table
-    strategy yields rows but **zero** groups (a common case where group labels
-    such as ``Customer Name: ...`` sit *outside* the detected tables) and parsing
-    the page text *does* recover groups, this transparently falls back to
-    text-line parsing and reports ``switched=True`` so the UI can warn the user.
-    """
-    if preferred == "regex" and row_regex:
-        recs = parse_text_lines(pages_text, group_label=group_label,
-                                row_regex=row_regex, total_tokens=total_tokens)
-        return recs, "regex", False
-
-    if preferred == "tables" and tables:
-        recs = parse_tables(tables, group_label=group_label, total_tokens=total_tokens)
-        if not list_detected_groups(recs):
-            text_recs = parse_text_lines(pages_text, group_label=group_label,
-                                         total_tokens=total_tokens)
-            if list_detected_groups(text_recs):
-                return text_recs, "text", True
-        return recs, "tables", False
-
-    recs = parse_text_lines(pages_text, group_label=group_label, total_tokens=total_tokens)
-    return recs, "text", False
-
-
-def list_detected_groups(records: Sequence[Record]) -> List[str]:
-    """Return unique detected group names in order of first appearance."""
-    seen: List[str] = []
-    for r in records:
-        if r.group and r.group not in seen:
-            seen.append(r.group)
-    return seen
+    date_field: str,
+    amount_field: str,
+    returns_field: str = "",
+    reference_field: str = "",
+) -> Tuple[List[Invoice], List[IgnoredLine]]:
+    """Validate rows against the semantic fields.  A row is an invoice only if
+    its date field strictly parses as a date and its amount fields are
+    numeric (or blank)."""
+    out: List[Invoice] = []
+    rejected: List[IgnoredLine] = []
+    for row in report.rows:
+        get = lambda label: _value(row, label) if label else ""
+        date_text, amount_text, returns_text = get(date_field), get(amount_field), get(returns_field)
+        date = values.parse_date(date_text, report.date_order)
+        amount = values.parse_amount(amount_text) if amount_text else None
+        returns = values.parse_amount(returns_text) if returns_text else None
+        reason = ""
+        if date is None:
+            reason = f"'{date_field}' is not a date ({date_text!r})"
+        elif amount_text and amount is None:
+            reason = f"'{amount_field}' is not numeric ({amount_text!r})"
+        elif returns_text and returns is None:
+            reason = f"'{returns_field}' is not numeric ({returns_text!r})"
+        elif amount is None and returns is None:
+            reason = "no amount"
+        if reason:
+            rejected.append(IgnoredLine(row.page, row.text, reason))
+            continue
+        out.append(Invoice(row.group, date, amount, returns, get(reference_field), row.page, row.text))
+    return out, rejected
 
 
-def list_field_names(records: Sequence[Record]) -> List[str]:
-    names: List[str] = []
-    for r in records:
-        for k in r.fields:
-            if k not in names:
-                names.append(k)
-    return names
+def _value(row: SourceRow, label: str) -> str:
+    key = values.label_key(label)
+    for name, text in row.values.items():
+        if values.label_key(name) == key:
+            return text.strip()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation against printed totals
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ReconLine:
+    scope: str
+    extracted: float
+    printed: Optional[float]
+
+    @property
+    def difference(self) -> Optional[float]:
+        return None if self.printed is None else round(self.extracted - self.printed, 2)
+
+    @property
+    def ok(self) -> bool:
+        return self.printed is not None and abs(self.extracted - self.printed) < _TOLERANCE
+
+
+@dataclass
+class Reconciliation:
+    lines: List[ReconLine] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def checked(self) -> bool:
+        return any(l.printed is not None for l in self.lines)
+
+    @property
+    def ok(self) -> bool:
+        return all(l.ok for l in self.lines if l.printed is not None)
+
+    @property
+    def failures(self) -> List[ReconLine]:
+        return [l for l in self.lines if l.printed is not None and not l.ok]
+
+
+def reconcile(report: ParsedReport, rows: List[Invoice]) -> Reconciliation:
+    """Compare extracted invoice sums with every printed total."""
+    result = Reconciliation()
+    by_group: Dict[str, List[Invoice]] = {}
+    for inv in rows:
+        by_group.setdefault(inv.group, []).append(inv)
+
+    printed_group_sum = 0.0
+    for group in report.groups:
+        invs = by_group.get(group, [])
+        amount = sum(i.amount or 0 for i in invs)
+        totals = report.group_totals.get(group, [])
+        if not invs:
+            result.warnings.append(f"Group '{group}' has no invoice rows.")
+        if not totals:
+            if report.group_total_label:
+                result.warnings.append(f"No printed {report.group_total_label} for '{group}'.")
+            result.lines.append(ReconLine(group, amount, None))
+            continue
+        printed = sum(t.amounts[0] for t in totals)
+        printed_group_sum += printed
+        result.lines.append(ReconLine(group, amount, printed))
+        if any(len(t.amounts) > 1 for t in totals):
+            ret = sum(i.returns or 0 for i in invs)
+            result.lines.append(ReconLine(f"{group} (returns)", ret,
+                                          sum(t.amounts[1] for t in totals if len(t.amounts) > 1)))
+
+    total = sum(i.amount or 0 for i in rows)
+    if report.grand_total:
+        result.lines.append(ReconLine("All invoices", total, report.grand_total.amounts[0]))
+        if report.group_totals:
+            result.lines.append(ReconLine(f"Sum of printed {report.group_total_label}s",
+                                          printed_group_sum, report.grand_total.amounts[0]))
+    else:
+        result.lines.append(ReconLine("All invoices", total, None))
+        result.warnings.append("No grand total printed; overall total could not be reconciled.")
+    return result

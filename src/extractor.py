@@ -1,209 +1,208 @@
-"""Document extraction orchestration.
+"""Turn a PDF or image into positioned words.
 
-Implements the "smart" extraction strategy:
+Whatever the source, the output is the same: pages of words with their x/y
+positions, plus any ruled table-row boxes pdfplumber can see (used to find
+exact column boundaries of a boxed header row).  Keeping positions is what
+lets the parser assign values to columns by layout instead of by token order.
 
-1.  Try digital text/table extraction with pdfplumber.
-2.  Fall back to PyMuPDF for text when pdfplumber yields little/no text.
-3.  Fall back to OCR (see :mod:`src.ocr`) for scanned PDFs and images.
-
-The output is a uniform :class:`ExtractionResult` containing per-page text,
-detected tables, the engine used, and any warnings.  Parsing into structured
-records is handled separately by :mod:`src.parser`, keeping extraction free of
-business assumptions.
+Strategy: pdfplumber words -> PyMuPDF words (if pdfplumber finds little text)
+-> OCR with word boxes (scanned PDFs and images).
 """
 from __future__ import annotations
 
 import io
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from . import ocr as ocr_module
-from . import table_detector
-
-
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif", ".gif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+_MIN_WORDS_PER_PAGE = 5
+_OCR_DPI = 300
+_LOW_OCR_CONFIDENCE = 70.0
 
 
 @dataclass
-class ExtractionResult:
-    pages_text: List[str] = field(default_factory=list)
-    tables: List[dict] = field(default_factory=list)   # normalised tables
+class Word:
+    text: str
+    x0: float
+    x1: float
+    top: float
+    bottom: float
+
+    @property
+    def xc(self) -> float:
+        return (self.x0 + self.x1) / 2
+
+    @property
+    def yc(self) -> float:
+        return (self.top + self.bottom) / 2
+
+    @property
+    def height(self) -> float:
+        return max(self.bottom - self.top, 1.0)
+
+
+Box = Tuple[float, float, float, float]  # x0, top, x1, bottom
+
+
+@dataclass
+class Page:
+    number: int
+    words: List[Word] = field(default_factory=list)
+    ruled_rows: List[List[Box]] = field(default_factory=list)  # first row of each ruled table
+
+
+@dataclass
+class Document:
+    pages: List[Page] = field(default_factory=list)
     engine: str = ""
-    ocr_confidence: Optional[float] = None
     warnings: List[str] = field(default_factory=list)
-    page_count: int = 0
+    ocr_confidence: Optional[float] = None
+
+    @property
+    def word_count(self) -> int:
+        return sum(len(p.words) for p in self.pages)
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-def extract(source, *, filename: str = "", mode: str = "auto", min_chars_per_page: int = 20) -> ExtractionResult:
-    """Extract content from ``source``.
-
-    ``source`` may be a path (str) or a bytes/file-like object.  ``filename`` is
-    used to detect the file type when ``source`` is bytes.  ``mode`` is one of
-    ``auto``, ``pdf_text``, ``ocr``, ``table``.
-    """
-    data, name = _read_source(source, filename)
-    ext = os.path.splitext(name)[1].lower()
-
+def extract(data: bytes, filename: str) -> Document:
+    ext = os.path.splitext(filename or "")[1].lower()
     if ext in IMAGE_EXTS:
-        return _extract_image(data, name)
+        return _ocr_image_bytes(data)
 
-    # Treat everything else as a PDF.
-    if mode == "ocr":
-        return _extract_pdf_ocr(data, name)
-
-    result = _extract_pdf_digital(data, name, want_tables=mode in ("auto", "table", "pdf_text"))
-
-    has_text = sum(len((t or "").strip()) for t in result.pages_text) >= min_chars_per_page
-    if mode == "auto" and not has_text:
-        result.warnings.append("Little or no selectable text found; falling back to OCR.")
-        ocr_result = _extract_pdf_ocr(data, name)
-        if ocr_result.pages_text and any(t.strip() for t in ocr_result.pages_text):
-            ocr_result.warnings = result.warnings + ocr_result.warnings
-            return ocr_result
-    return result
+    doc = _pdfplumber_words(data)
+    if _too_little_text(doc):
+        fallback = _pymupdf_words(data)
+        fallback.warnings = doc.warnings + fallback.warnings
+        doc = fallback if fallback.word_count > doc.word_count else doc
+    if _too_little_text(doc):
+        ocr = _ocr_pdf(data)
+        ocr.warnings = doc.warnings + ["Little or no selectable text; used OCR."] + ocr.warnings
+        doc = ocr if ocr.word_count > doc.word_count else doc
+    return doc
 
 
-def _read_source(source, filename):
-    if isinstance(source, (bytes, bytearray)):
-        return bytes(source), filename or "upload.pdf"
-    if hasattr(source, "read"):
-        data = source.read()
-        name = filename or getattr(source, "name", "upload.pdf")
-        return data, name
-    # Assume path.
-    with open(source, "rb") as fh:
-        return fh.read(), filename or os.path.basename(source)
+def _too_little_text(doc: Document) -> bool:
+    return not doc.pages or doc.word_count < _MIN_WORDS_PER_PAGE * len(doc.pages)
 
 
 # ---------------------------------------------------------------------------
-# PDF: digital text + tables via pdfplumber, PyMuPDF fallback
+# Digital PDFs
 # ---------------------------------------------------------------------------
 
-def _extract_pdf_digital(data: bytes, name: str, want_tables: bool) -> ExtractionResult:
-    result = ExtractionResult(engine="pdfplumber")
+def _pdfplumber_words(data: bytes) -> Document:
+    doc = Document(engine="pdfplumber")
     try:
         import pdfplumber
-    except Exception as exc:
-        result.warnings.append(f"pdfplumber unavailable ({exc}); trying PyMuPDF.")
-        return _extract_pdf_pymupdf(data, name)
-
+    except Exception as exc:  # pragma: no cover - dependency problem
+        doc.warnings.append(f"pdfplumber unavailable: {exc}")
+        return doc
     try:
         with pdfplumber.open(io.BytesIO(data)) as pdf:
-            result.page_count = len(pdf.pages)
-            for i, page in enumerate(pdf.pages, start=1):
-                text = page.extract_text() or ""
-                result.pages_text.append(text)
-                if want_tables:
-                    try:
-                        for tbl in page.extract_tables() or []:
-                            norm = table_detector.normalise_table(tbl, page=i)
-                            norm = table_detector.drop_empty_rows(norm)
-                            if norm["rows"]:
-                                result.tables.append(norm)
-                    except Exception as exc:  # pragma: no cover
-                        result.warnings.append(f"Table extraction failed on page {i}: {exc}")
+            for i, pg in enumerate(pdf.pages, start=1):
+                page = Page(number=i)
+                for w in pg.extract_words():
+                    page.words.append(Word(w["text"], w["x0"], w["x1"], w["top"], w["bottom"]))
+                try:
+                    for table in pg.find_tables():
+                        cells = [c for c in table.rows[0].cells if c] if table.rows else []
+                        if len(cells) >= 2:
+                            page.ruled_rows.append([tuple(c) for c in cells])
+                except Exception:  # ruled boxes are an optional hint only
+                    pass
+                doc.pages.append(page)
     except Exception as exc:
-        result.warnings.append(f"pdfplumber failed ({exc}); trying PyMuPDF.")
-        return _extract_pdf_pymupdf(data, name)
-
-    if not any(t.strip() for t in result.pages_text):
-        # No text at all – let the caller decide about OCR.
-        result.warnings.append("pdfplumber found no text.")
-    return result
+        doc.warnings.append(f"pdfplumber could not read the PDF: {exc}")
+    return doc
 
 
-def _extract_pdf_pymupdf(data: bytes, name: str) -> ExtractionResult:
-    result = ExtractionResult(engine="pymupdf")
+def _pymupdf_words(data: bytes) -> Document:
+    doc = Document(engine="pymupdf")
     try:
-        import fitz  # PyMuPDF
-    except Exception as exc:
-        result.warnings.append(f"PyMuPDF unavailable ({exc}).")
-        return result
-    try:
-        doc = fitz.open(stream=data, filetype="pdf")
-        result.page_count = doc.page_count
-        for page in doc:
-            result.pages_text.append(page.get_text("text") or "")
+        import pymupdf
     except Exception as exc:  # pragma: no cover
-        result.warnings.append(f"PyMuPDF failed: {exc}")
-    return result
-
-
-# ---------------------------------------------------------------------------
-# PDF: OCR per page
-# ---------------------------------------------------------------------------
-
-def _extract_pdf_ocr(data: bytes, name: str) -> ExtractionResult:
-    result = ExtractionResult(engine="ocr")
-    if not ocr_module.ocr_available():
-        result.warnings.append("OCR requested but no OCR engine is installed.")
-        return result
+        doc.warnings.append(f"PyMuPDF unavailable: {exc}")
+        return doc
     try:
-        import fitz
+        with pymupdf.open(stream=data, filetype="pdf") as pdf:
+            for i, pg in enumerate(pdf, start=1):
+                page = Page(number=i)
+                for x0, y0, x1, y1, text, *_ in pg.get_text("words"):
+                    page.words.append(Word(text, x0, x1, y0, y1))
+                doc.pages.append(page)
     except Exception as exc:
-        result.warnings.append(f"PyMuPDF needed to rasterise PDF for OCR is unavailable ({exc}).")
-        return result
+        doc.warnings.append(f"PyMuPDF could not read the PDF: {exc}")
+    return doc
 
+
+# ---------------------------------------------------------------------------
+# OCR (scanned PDFs and images)
+# ---------------------------------------------------------------------------
+
+def _ocr_pdf(data: bytes) -> Document:
+    doc = Document(engine="ocr")
+    try:
+        import pymupdf
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover
+        doc.warnings.append(f"OCR needs PyMuPDF and Pillow: {exc}")
+        return doc
+    confidences = []
+    with pymupdf.open(stream=data, filetype="pdf") as pdf:
+        for i, pg in enumerate(pdf, start=1):
+            pix = pg.get_pixmap(dpi=_OCR_DPI)
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            words, conf, warn = _ocr_words(image, scale=72.0 / _OCR_DPI)
+            doc.pages.append(Page(number=i, words=words))
+            doc.warnings.extend(warn)
+            if conf is not None:
+                confidences.append(conf)
+            if warn and "unavailable" in warn[0]:
+                break
+    _finish_ocr(doc, confidences)
+    return doc
+
+
+def _ocr_image_bytes(data: bytes) -> Document:
+    doc = Document(engine="ocr")
     try:
         from PIL import Image
+        image = Image.open(io.BytesIO(data))
     except Exception as exc:
-        result.warnings.append(f"Pillow needed for OCR is unavailable ({exc}).")
-        return result
+        doc.warnings.append(f"Could not open image: {exc}")
+        return doc
+    words, conf, warn = _ocr_words(image, scale=1.0)
+    doc.pages.append(Page(number=1, words=words))
+    doc.warnings.extend(warn)
+    _finish_ocr(doc, [conf] if conf is not None else [])
+    return doc
 
-    confs: List[float] = []
+
+def _ocr_words(image, scale: float):
+    """Run Tesseract and return (words with boxes, mean confidence, warnings)."""
     try:
-        doc = fitz.open(stream=data, filetype="pdf")
-        result.page_count = doc.page_count
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_res = ocr_module.ocr_image(img)
-            result.pages_text.append(ocr_res.text)
-            result.warnings.extend(ocr_res.warnings)
-            if ocr_res.confidence is not None:
-                confs.append(ocr_res.confidence)
-            # Build a whitespace table to help downstream parsing.
-            tbl = table_detector.text_to_table(ocr_res.text, page=page.number + 1)
-            tbl = table_detector.drop_empty_rows(tbl)
-            if tbl["rows"]:
-                tbl["ocr_confidence"] = ocr_res.confidence
-                result.tables.append(tbl)
-    except Exception as exc:  # pragma: no cover
-        result.warnings.append(f"OCR extraction failed: {exc}")
-
-    result.ocr_confidence = sum(confs) / len(confs) if confs else None
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Image files
-# ---------------------------------------------------------------------------
-
-def _extract_image(data: bytes, name: str) -> ExtractionResult:
-    result = ExtractionResult(engine="ocr-image")
-    if not ocr_module.ocr_available():
-        result.warnings.append("Image OCR requested but no OCR engine is installed.")
-        return result
-    try:
-        from PIL import Image
-        img = Image.open(io.BytesIO(data))
+        import pytesseract
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     except Exception as exc:
-        result.warnings.append(f"Could not open image: {exc}")
-        return result
+        return [], None, [f"OCR engine unavailable (install Tesseract + pytesseract): {exc}"]
+    words, confs = [], []
+    for text, left, top, width, height, conf in zip(
+            data["text"], data["left"], data["top"], data["width"], data["height"], data["conf"]):
+        text = str(text).strip()
+        if not text:
+            continue
+        words.append(Word(text, left * scale, (left + width) * scale,
+                          top * scale, (top + height) * scale))
+        try:
+            if float(conf) >= 0:
+                confs.append(float(conf))
+        except (TypeError, ValueError):
+            pass
+    return words, (sum(confs) / len(confs) if confs else None), []
 
-    ocr_res = ocr_module.ocr_image(img)
-    result.pages_text.append(ocr_res.text)
-    result.warnings.extend(ocr_res.warnings)
-    result.ocr_confidence = ocr_res.confidence
-    result.page_count = 1
-    tbl = table_detector.text_to_table(ocr_res.text, page=1)
-    tbl = table_detector.drop_empty_rows(tbl)
-    if tbl["rows"]:
-        tbl["ocr_confidence"] = ocr_res.confidence
-        result.tables.append(tbl)
-    return result
+
+def _finish_ocr(doc: Document, confidences: list) -> None:
+    if confidences:
+        doc.ocr_confidence = sum(confidences) / len(confidences)
+        if doc.ocr_confidence < _LOW_OCR_CONFIDENCE:
+            doc.warnings.append(
+                f"Low OCR confidence ({doc.ocr_confidence:.0f}%). Check every value in the preview.")
