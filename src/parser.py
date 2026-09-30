@@ -110,6 +110,7 @@ class ColumnStats:
 @dataclass
 class ParsedReport:
     group_label: str = ""
+    title: str = ""
     columns: List[str] = field(default_factory=list)
     groups: List[str] = field(default_factory=list)
     rows: List[SourceRow] = field(default_factory=list)
@@ -209,6 +210,8 @@ def parse(
         report.warnings.append("No column header line was detected.")
 
     report.period = _period(preamble)
+    report.title = next((l.text for l in preamble
+                         if not re.search(r"[\d:]", l.text) and len(l.words) >= 2), "")
     report.date_order = _resolve_order(date_order, report.rows)
     report.column_stats = _column_stats(report)
     _classify_summaries(report, summaries, group_total_label)

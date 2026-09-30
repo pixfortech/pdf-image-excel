@@ -33,6 +33,7 @@ import openpyxl
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import audit, pipeline, profiles, values  # noqa: E402
+from src.layout import resolve_layout  # noqa: E402
 from src.profiles import ProfileStore  # noqa: E402
 from src.workbook import verify_update  # noqa: E402
 
@@ -82,8 +83,8 @@ def independent_checks(prepared, result) -> list:
         if c.sheet not in mapped:
             problems.append(f"write to unmapped sheet {c.sheet}")
     for row in result.rows:
-        layout = prepared.profile.layout_for(row.sheet)
-        date_letter, _ = prepared.wb.resolve(row.sheet, layout.date, layout.header_row)
+        resolved = resolve_layout(prepared.wb, row.sheet, prepared.profile.layout_for(row.sheet), False)
+        date_letter = resolved.date
         r = int("".join(ch for ch in row.cell if ch.isdigit()))
         cell_date = values.parse_date(after[row.sheet][f"{date_letter}{r}"].value, allow_serial=True)
         if cell_date != row.total.date:

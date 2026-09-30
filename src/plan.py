@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 from . import values
 from .parser import Invoice
 from .profiles import FORMULA, SKIP_NONEMPTY, Profile, lookup_group
+from .layout import resolve_layout
 from .workbook import CellChange, Workbook
 
 READY_NEW = "Ready"
@@ -112,6 +113,8 @@ class SheetStatus:
     target: str
     status: str
     note: str = ""
+    via: str = ""              # "pattern" (common pattern) or "exception" (sheet override)
+    returns_target: str = ""
 
 
 @dataclass
@@ -141,8 +144,13 @@ def build_plan(totals: List[DailyTotal], profile: Profile, wb: Workbook) -> Plan
     for group, group_totals in by_group.items():
         match = lookup_group(profile, group)
         sheet = match.sheet
-        layout = profile.layout_for(sheet) if sheet else None
-        group_status, note, date_letter, amount_letter, returns_letter = "", "", None, None, None
+        group_status, note, resolved = "", "", None
+        date_letter = amount_letter = returns_letter = None
+        # A returns target is needed only when there is a return value to write
+        # (blank source returns are never written unless zero-fill is on).
+        need_returns = bool(settings.write_returns and profile.source.returns_field
+                            and (settings.zero_fill_returns
+                                 or any(t.returns is not None for t in group_totals)))
 
         if match.status == "ignored":
             group_status = IGNORED
@@ -152,31 +160,26 @@ def build_plan(totals: List[DailyTotal], profile: Profile, wb: Workbook) -> Plan
             group_status = UNMAPPED
         elif not wb.has_sheet(sheet):
             group_status, note = SHEET_MISSING, f"'{sheet}' is not in this workbook"
+        elif not profile.layout_for(sheet).amount.is_set:
+            group_status, note = COLUMN_PROBLEM, "worksheet pattern not set up yet"
         else:
-            date_letter, p1 = wb.resolve(sheet, layout.date, layout.header_row)
-            amount_letter, p2 = wb.resolve(sheet, layout.amount, layout.header_row)
-            # A return target only matters when there is a return value to
-            # write (blank source returns are never written unless zero-fill).
-            wants_returns = (settings.write_returns and profile.source.returns_field
-                             and layout.returns.is_set
-                             and (settings.zero_fill_returns
-                                  or any(t.returns is not None for t in group_totals)))
-            returns_letter, p3 = (wb.resolve(sheet, layout.returns, layout.header_row)
-                                  if wants_returns else (None, ""))
-            problems = [f"date: {p1}" if p1 else "", f"amount: {p2}" if p2 else "",
-                        f"returns: {p3}" if p3 else ""]
-            problems = [p for p in problems if p]
-            if problems:
-                group_status, note = COLUMN_PROBLEM, "; ".join(problems)
+            resolved = resolve_layout(wb, sheet, profile.layout_for(sheet), need_returns)
+            if resolved.ok:
+                date_letter, amount_letter, returns_letter = resolved.date, resolved.amount, resolved.returns
+            else:
+                group_status, note = COLUMN_PROBLEM, "; ".join(resolved.problems)
 
-        dates_index = wb.date_rows(sheet, date_letter, layout.header_row, profile.source.date_order) \
-            if date_letter and not group_status else {}
+        dates_index = wb.date_rows(sheet, date_letter, resolved.header_row, profile.source.date_order) \
+            if date_letter else {}
         matched = sum(1 for t in group_totals if len(dates_index.get(t.date, [])) == 1)
         if match.status == "alias" and not note:
             note = f"matched saved name '{match.saved_name}'"
         plan.sheets.append(SheetStatus(
             group, sheet, matched, len(group_totals),
-            layout.amount.describe() if layout else "", group_status or _group_ready(matched, group_totals), note))
+            resolved.describe(amount_letter) if amount_letter else "",
+            group_status or _group_ready(matched, group_totals), note,
+            via="exception" if sheet in profile.sheet_overrides else ("pattern" if sheet else ""),
+            returns_target=resolved.describe(returns_letter) if returns_letter else ""))
 
         for t in group_totals:
             targets = [("amount", amount_letter)]

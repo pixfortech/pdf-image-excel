@@ -64,6 +64,7 @@ class Workbook:
             raise WorkbookError(f"Could not open the workbook: {exc}") from exc
         self.sheets: List[str] = list(self._wb.sheetnames)
         self._dates: Dict[tuple, Dict[_dt.date, List[int]]] = {}
+        self._headers: Dict[tuple, List[Tuple[str, str]]] = {}
 
     def has_sheet(self, sheet: str) -> bool:
         return sheet in self.sheets
@@ -73,35 +74,25 @@ class Workbook:
         return "" if value is None else str(value)
 
     def headers(self, sheet: str, row: int) -> List[Tuple[str, str]]:
-        ws = self._wb[sheet]
-        out = []
-        for c in range(1, ws.max_column + 1):
-            letter = get_column_letter(c)
-            out.append((letter, self.header(sheet, row, letter)))
-        return out
+        """``(letter, header text)`` for every column of ``row`` (cached)."""
+        key = (sheet, row)
+        if key not in self._headers:
+            ws = self._wb[sheet]
+            self._headers[key] = [(get_column_letter(c), self.header(sheet, row, get_column_letter(c)))
+                                  for c in range(1, ws.max_column + 1)]
+        return self._headers[key]
 
-    def resolve(self, sheet: str, ref: ColumnRef, header_row: int) -> Tuple[Optional[str], str]:
-        """Return ``(letter, problem)``.  A letter is validated against the
-        header text saved with it; a header-only reference must be unique."""
-        if not ref.is_set:
-            return None, "not configured"
-        if ref.letter:
-            try:
-                column_index_from_string(ref.letter)
-            except ValueError:
-                return None, f"invalid column '{ref.letter}'"
-            actual = self.header(sheet, header_row, ref.letter)
-            if ref.header and values.label_key(actual) != values.label_key(ref.header):
-                return None, (f"column {ref.letter} is now headed '{actual or '(blank)'}', "
-                              f"expected '{ref.header}'")
-            return ref.letter, ""
-        matches = [l for l, text in self.headers(sheet, header_row)
-                   if text and values.label_key(text) == values.label_key(ref.header)]
-        if len(matches) == 1:
-            return matches[0], ""
-        if not matches:
-            return None, f"no column headed '{ref.header}' in row {header_row}"
-        return None, f"header '{ref.header}' repeats in columns {', '.join(matches)}; choose a letter"
+    def is_formula_column(self, sheet: str, letter: str, header_row: int, sample: int = 30) -> bool:
+        """True when most filled cells below the header hold formulas."""
+        ws = self._wb[sheet]
+        col = column_index_from_string(letter)
+        filled = formulas = 0
+        for r in range(header_row + 1, min(ws.max_row, header_row + sample) + 1):
+            c = ws.cell(row=r, column=col)
+            if c.value is not None:
+                filled += 1
+                formulas += c.data_type == "f"
+        return filled > 0 and formulas * 2 > filled
 
     def date_rows(self, sheet: str, letter: str, header_row: int,
                   order: str = values.DMY) -> Dict[_dt.date, List[int]]:

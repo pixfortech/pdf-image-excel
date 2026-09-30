@@ -77,19 +77,6 @@ def test_verification_catches_unplanned_changes(book):
     assert verify_update(book, sneaky, planned)
 
 
-def test_resolve_validates_saved_header_and_repeated_headers():
-    data = make_workbook(["S1"], other_layout=["K1"])
-    wb = Workbook(data)
-    assert wb.resolve("S1", ColumnRef("B", "CHALLAN"), 1) == ("B", "")
-    letter, problem = wb.resolve("K1", ColumnRef("B", "CHALLAN"), 1)
-    assert letter is None and "KARKHANA" in problem
-    assert wb.resolve("S1", ColumnRef(header="challan"), 1) == ("B", "")
-    dup = openpyxl.load_workbook(io.BytesIO(data))
-    dup["S1"]["C1"] = "CHALLAN"
-    buf = io.BytesIO(); dup.save(buf)
-    assert "repeats" in Workbook(buf.getvalue()).resolve("S1", ColumnRef(header="CHALLAN"), 1)[1]
-
-
 def test_real_dates_behind_short_display_and_full_column_scan(book):
     wb = Workbook(book)
     index = wb.date_rows("S1", "A", 1)

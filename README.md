@@ -30,18 +30,37 @@ ready to write.”* It never reports success for zero changes.
 
 ## First use (or when something changes)
 
-The first time, the app suggests the report fields from their contents (the
-column of dates, the column of amounts) and asks, once:
+Setting up takes two steps, both remembered:
 
-* which worksheet each customer belongs to (or to ignore a customer);
-* the worksheet columns: header row, DATE column, main amount target, optional
-  returns target — set on one template worksheet and used by every mapped
-  worksheet with the same headers;
-* an override for any worksheet whose columns differ from the template.
+1. **Customer → Worksheet.** Choose the worksheet for each customer (or ignore
+   a customer). Names are matched later ignoring case, punctuation and spacing,
+   so `NORTH MARKET` also finds `NORTHMARKET` — but never by guessing between
+   two candidates. Mappings saved for other report types are pre-filled.
+2. **Worksheet pattern.** The app takes the pattern from the mapped worksheet
+   whose headers most other mapped worksheets share (never an unrelated sheet
+   such as a consolidated summary), detects the DATE column and — when a header
+   matches the report's Returns field — the returns column. You choose once
+   which column the report's main amount goes to. The dropdowns always show the
+   headers of the worksheet currently selected.
 
-Click **Save mapping**; from then on it is automatic. Later, the app asks only
-about what is new or different: a new customer, a worksheet whose headers have
-changed, a saved report field that no longer matches.
+The pattern is stored by **header name**, so it applies automatically to every
+mapped worksheet that has those headers, even if a column or the header row
+has moved. Only worksheets laid out differently appear under **Needs
+attention**, each with its own small editor; nothing else has to be configured
+sheet by sheet.
+
+On later runs the Review step only shows:
+
+```
+Customer → Worksheet     (table: worksheet, dates found, target, status)
+Worksheet pattern        DATE → A / DATE
+                         Total Amount → B / CHALLAN
+                         Returns → C / RETURN
+                         Applied automatically to 12 of 13 mapped worksheets
+```
+
+Everything technical (report fields, all customers, the pattern, per-sheet
+exceptions, write settings) is under **Advanced mapping**.
 
 ## What it guarantees
 

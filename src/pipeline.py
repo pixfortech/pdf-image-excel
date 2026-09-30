@@ -12,7 +12,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from . import extractor, parser, plan as plan_mod, profiles, workbook
+from . import extractor, layout, parser, plan as plan_mod, profiles, workbook
 from .profiles import Profile, ProfileStore
 
 LOADED = "loaded"        # a saved profile recognised this report
@@ -36,6 +36,7 @@ class Prepared:
     totals: List[plan_mod.DailyTotal] = field(default_factory=list)
     plan: plan_mod.Plan = field(default_factory=plan_mod.Plan)
     wb: Optional[workbook.Workbook] = None
+    pattern: Optional[layout.PatternSuggestion] = None   # proposal while the pattern is not set up
     workbook_error: str = ""
 
     # ---- readiness -------------------------------------------------------
@@ -95,6 +96,7 @@ def prepare(pdf_bytes: bytes, pdf_name: str, xlsx_bytes: bytes, xlsx_name: str,
         source = LOADED if profile else NEW
         if profile is None:
             profile = profiles.suggest_profile(probe)
+            _prefill_groups(profile, probe.groups, store)
 
     s = profile.source
     report = parser.parse(doc, group_label=s.group_label, header_labels=s.columns,
@@ -114,8 +116,23 @@ def prepare(pdf_bytes: bytes, pdf_name: str, xlsx_bytes: bytes, xlsx_name: str,
     except workbook.WorkbookError as exc:
         prepared.workbook_error = str(exc)
         return prepared
+    if not profile.sheet_template.amount.is_set:
+        prepared.pattern = layout.detect_pattern(prepared.wb, profile.mapped_sheets(),
+                                                 profile.source.returns_field)
     prepared.plan = plan_mod.build_plan(prepared.totals, profile, prepared.wb)
     return prepared
+
+
+def _prefill_groups(profile: Profile, groups, store: Optional[ProfileStore]) -> None:
+    """Reuse group -> worksheet assignments already saved in other profiles."""
+    known = store.known_group_sheets() if store else {}
+    if not known:
+        return
+    reference = Profile(group_to_sheet=known)
+    for group in groups:
+        match = profiles.lookup_group(reference, group)
+        if match.status in ("mapped", "alias"):
+            profile.group_to_sheet[group] = match.sheet
 
 
 def update(prepared: Prepared, store: Optional[ProfileStore] = None,

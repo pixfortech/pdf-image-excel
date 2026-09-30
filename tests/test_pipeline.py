@@ -41,7 +41,7 @@ def test_recognised_mapping_plans_each_group_into_its_own_sheet(store, files):
     status = {s.group: s for s in p.plan.sheets}
     assert status["ALPHA ONE"].status == plan.READY_NEW and status["ALPHA ONE"].sheet == "S1"
     assert status["GAMMA THREE"].status == plan.COLUMN_PROBLEM            # K1 differs from template
-    assert "KARKHANA" in status["GAMMA THREE"].note
+    assert "no 'CHALLAN' column" in status["GAMMA THREE"].note          # only this sheet is flagged
 
     day = next(r for r in p.plan.rows if r.total.group == "ALPHA ONE" and r.total.date == dt.date(2026, 8, 3))
     assert (day.sheet, day.cell, day.new_value, day.status) == \

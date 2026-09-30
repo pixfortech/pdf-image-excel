@@ -87,6 +87,7 @@ class Profile:
     group_to_sheet: Dict[str, str] = field(default_factory=dict)
     ignored_groups: List[str] = field(default_factory=list)
     sheet_template: SheetLayout = field(default_factory=SheetLayout)
+    template_sheet: str = ""              # worksheet the common pattern was taken from
     sheet_overrides: Dict[str, SheetLayout] = field(default_factory=dict)
     write: WriteSettings = field(default_factory=WriteSettings)
     profile_version: int = PROFILE_VERSION
@@ -147,6 +148,11 @@ def remember_group(profile: Profile, name: str, sheet: str) -> None:
         del profile.group_to_sheet[g]
     profile.ignored_groups = [g for g in profile.ignored_groups if values.name_key(g) != key]
     profile.group_to_sheet[name] = sheet
+
+
+def coverage(profile: Profile, groups) -> int:
+    """How many of ``groups`` this profile can resolve (mapped, alias or ignored)."""
+    return sum(lookup_group(profile, g).status in ("mapped", "alias", "ignored") for g in groups)
 
 
 def ignore_group(profile: Profile, name: str) -> None:
@@ -218,7 +224,7 @@ def suggest_profile(report, name: str = "") -> Profile:
                if k in ("amount", "empty") and "return" in values.label_key(c)]
     amount = next((c for c in amounts if c not in returns), "")
     return Profile(
-        profile_name=name or (f"{report.group_label} report" if report.group_label else "New profile"),
+        profile_name=name or report.title or (f"{report.group_label} report" if report.group_label else "New profile"),
         source=SourceSchema(
             group_label=report.group_label,
             columns=list(report.columns),
@@ -270,6 +276,7 @@ def from_dict(data: dict) -> Profile:
         group_to_sheet=dict(data.get("group_to_sheet", {}) or {}),
         ignored_groups=list(data.get("ignored_groups", []) or []),
         sheet_template=_layout(data.get("sheet_template")),
+        template_sheet=data.get("template_sheet", ""),
         sheet_overrides={k: _layout(v) for k, v in (data.get("sheet_overrides", {}) or {}).items()},
         write=WriteSettings(**{k: wr[k] for k in WriteSettings.__dataclass_fields__ if k in wr}),
         created=data.get("created", ""), updated=data.get("updated", ""),
@@ -406,10 +413,19 @@ class ProfileStore:
         return self.save(profile)
 
     def find_for(self, report) -> Optional[Profile]:
-        """The most recently successful profile whose source structure matches."""
+        """The compatible profile (same report structure) that maps the most of
+        this report's groups; ties go to the last successful, then newest."""
         matching = [p for p in self.all() if source_matches(p, report)]
-        matching.sort(key=lambda p: (p.last_success, p.updated), reverse=True)
+        matching.sort(key=lambda p: (coverage(p, report.groups), p.last_success, p.updated), reverse=True)
         return matching[0] if matching else None
+
+    def known_group_sheets(self) -> Dict[str, str]:
+        """Group -> worksheet assignments from every saved profile (newest
+        first), used to pre-fill a new report type's mapping."""
+        merged: Dict[str, str] = {}
+        for p in sorted(self.all(), key=lambda p: (p.last_success, p.updated)):
+            merged.update(p.group_to_sheet)
+        return merged
 
     def last_successful(self) -> Optional[Profile]:
         used = [p for p in self.all() if p.last_success]

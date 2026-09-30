@@ -1,9 +1,9 @@
 """PDF / image report -> update an existing Excel workbook.
 
-Normal use is three steps: upload both files, review the preview, click
-"Update uploaded workbook".  The mapping is recognised from the report's
-structure and loaded from the local profile store; you are asked only about
-what is new or has changed.
+Normal use: upload the report and the workbook, look at the preview, click
+"Update uploaded workbook".  The saved profile (customer -> worksheet and one
+common worksheet pattern) is recognised and applied automatically; only
+exceptions are shown.
 
 Run:  streamlit run app.py
 """
@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import copy
 import json
+from typing import Optional
 
 import pandas as pd
 import streamlit as st
 
 from src import audit, pipeline, plan as plan_mod, profiles, values
+from src.layout import resolve_layout
 from src.profiles import (ColumnRef, FORMULA, NUMERIC, OVERWRITE, SKIP_NONEMPTY,
                           Profile, ProfileStore, SheetLayout)
 
@@ -24,6 +26,9 @@ ss = st.session_state
 ss.setdefault("store_version", 0)
 ss.setdefault("forced_profile", "")
 ss.setdefault("result", None)
+
+IGNORE = "(ignore this customer)"
+GROUP_PROBLEMS = (plan_mod.UNMAPPED, plan_mod.AMBIGUOUS, plan_mod.SHEET_MISSING)
 
 
 @st.cache_resource
@@ -34,7 +39,7 @@ def get_store() -> ProfileStore:
 store = get_store()
 
 
-def saved(profile: Profile, message: str) -> None:
+def save(profile: Profile, message: str) -> None:
     store.save(profile)
     ss.store_version += 1
     ss.result = None
@@ -48,24 +53,22 @@ def saved(profile: Profile, message: str) -> None:
 
 def sidebar(prepared) -> None:
     st.sidebar.header("Mapping profiles")
-    st.sidebar.caption(f"Stored locally in `{store.root}` (never uploaded to Git).")
+    st.sidebar.caption(f"Saved on this computer in `{store.root}` (never uploaded to Git).")
     names = store.names()
     options = [""] + names
     current = ss.forced_profile if ss.forced_profile in names else ""
-    choice = st.sidebar.selectbox(
-        "Profile", options, index=options.index(current),
-        format_func=lambda n: n or "Automatic — recognise from the report",
-    )
+    choice = st.sidebar.selectbox("Profile", options, index=options.index(current),
+                                  format_func=lambda n: n or "Automatic — recognise from the report")
     if choice != ss.forced_profile:
         ss.forced_profile, ss.result = choice, None
         st.rerun()
     last = store.last_successful()
-    if last and st.sidebar.button("Use last successful mapping", use_container_width=True):
+    if last and st.sidebar.button("Use last successful mapping", width="stretch"):
         ss.forced_profile, ss.result = last.profile_name, None
         st.rerun()
 
-    uploaded = st.sidebar.file_uploader("Import profile JSON", type=["json"], key="import_json")
-    if uploaded is not None and st.sidebar.button("Import", use_container_width=True):
+    uploaded = st.sidebar.file_uploader("Import profile JSON (backup / other computer)", type=["json"])
+    if uploaded is not None and st.sidebar.button("Import", width="stretch"):
         try:
             p = store.import_json(uploaded.getvalue().decode("utf-8"))
             ss.store_version += 1
@@ -73,14 +76,14 @@ def sidebar(prepared) -> None:
         except (ValueError, json.JSONDecodeError) as exc:
             st.sidebar.error(f"Not a valid profile: {exc}")
 
-    if prepared is None or not store.load(prepared.profile.profile_name):
+    profile = store.load(prepared.profile.profile_name) if prepared else None
+    if profile is None:
         return
-    profile = store.load(prepared.profile.profile_name)
     st.sidebar.divider()
     st.sidebar.markdown(f"**Current:** {profile.profile_name}")
     st.sidebar.download_button("Export profile JSON", profiles.to_json(profile),
                                file_name=f"{profile.profile_name}.json", mime="application/json",
-                               use_container_width=True)
+                               width="stretch")
     with st.sidebar.expander("Rename / reset / delete"):
         new_name = st.text_input("New name", value=profile.profile_name)
         if st.button("Rename") and new_name.strip() and new_name != profile.profile_name:
@@ -91,11 +94,11 @@ def sidebar(prepared) -> None:
                 st.rerun()
             except ValueError as exc:
                 st.error(str(exc))
-        if st.checkbox("Reset this profile's customer and sheet mapping"):
+        if st.checkbox("Reset this profile's customer and worksheet mapping"):
             if st.button("Reset mapping"):
                 profile.group_to_sheet, profile.ignored_groups = {}, []
-                profile.sheet_template, profile.sheet_overrides = SheetLayout(), {}
-                saved(profile, "Mapping reset.")
+                profile.sheet_template, profile.sheet_overrides, profile.template_sheet = SheetLayout(), {}, ""
+                save(profile, "Mapping reset.")
         if st.checkbox("Delete this profile permanently"):
             if st.button("Delete profile", type="primary"):
                 store.delete(profile.profile_name)
@@ -105,159 +108,258 @@ def sidebar(prepared) -> None:
 
 
 # ===========================================================================
-# Mapping editor (first run, exceptions, or Advanced)
+# Column pickers — always built from the CURRENT worksheet's real headers
 # ===========================================================================
 
-def _default_letter(headers: dict, current: ColumnRef):
-    """Pre-select by the saved HEADER first (a template's 'RETURN' may be in a
-    different column on another sheet); if that header is absent, pre-select
-    nothing so the user must choose — never a same-letter column by accident."""
-    if current.header:
-        key = values.label_key(current.header)
-        found = [l for l, h in headers.items() if values.label_key(h) == key]
+def _default_letter(headers: dict, ref: ColumnRef) -> Optional[str]:
+    """Pre-select by saved header name first (a pattern's RETURN may sit in a
+    different column on another sheet); if absent, pre-select nothing."""
+    if ref.header:
+        key = values.label_key(ref.header)
+        found = [l for l, h in headers.items() if h and values.label_key(h) == key]
         if len(found) == 1:
             return found[0]
-        if current.letter and values.label_key(headers.get(current.letter, "")) == key:
-            return current.letter
+        if ref.letter and values.label_key(headers.get(ref.letter, "")) == key:
+            return ref.letter
         return None
-    return current.letter if current.letter in headers else None
+    return ref.letter if headers.get(ref.letter) else None
 
 
-def column_select(label, wb, sheet, header_row, current: ColumnRef, key, optional=False) -> ColumnRef:
-    headers = dict(wb.headers(sheet, header_row))
+def column_picker(label, wb, sheet, header_row, ref: ColumnRef, key_prefix, field, optional=False) -> ColumnRef:
+    """The widget key contains the worksheet and header row, so choosing a
+    different worksheet always shows that worksheet's columns — never stale ones."""
+    headers = {l: h for l, h in wb.headers(sheet, header_row) if h.strip()}
     letters = list(headers)
-    default = _default_letter(headers, current)
-    index = letters.index(default) if default else None
+    default = _default_letter(headers, ref)
     options = ([""] if optional else []) + letters
-    if optional:
-        index = 0 if index is None else index + 1
-    choice = st.selectbox(label, options, index=index, key=key, placeholder="Choose a column",
-                          format_func=lambda l: "— do not write —" if not l else f"{l} — {headers.get(l) or '(blank)'}")
-    return ColumnRef(choice, headers.get(choice, "")) if choice else ColumnRef()
+    index = options.index(default) if default in options else (0 if optional else None)
+    choice = st.selectbox(label, options, index=index, placeholder="Choose a column",
+                          key=f"{key_prefix}_{sheet}_{header_row}_{field}",
+                          format_func=lambda l: "— do not write —" if not l else f"{l} — {headers[l]}")
+    return ColumnRef(choice, headers[choice]) if choice else ColumnRef()
 
 
-def layout_inputs(wb, sheet, layout: SheetLayout, key: str, returns_needed: bool) -> SheetLayout:
+def layout_editor(wb, sheet, base: SheetLayout, key_prefix, amount_label, returns_label) -> SheetLayout:
     c0, c1, c2, c3 = st.columns([1, 2, 2, 2])
-    header_row = c0.number_input("Header row", 1, 50, int(layout.header_row or 1), key=f"{key}_hr")
+    header_row = int(c0.number_input("Header row", 1, 50, int(base.header_row or 1),
+                                     key=f"{key_prefix}_{sheet}_hr"))
     with c1:
-        date = column_select("DATE column", wb, sheet, header_row, layout.date, f"{key}_date")
+        date = column_picker("DATE column (row matching)", wb, sheet, header_row, base.date, key_prefix, "date")
     with c2:
-        amount = column_select("Main amount target", wb, sheet, header_row, layout.amount, f"{key}_amt")
+        amount = column_picker(f"PDF '{amount_label}' goes to", wb, sheet, header_row, base.amount,
+                               key_prefix, "amount")
     with c3:
-        returns = column_select("Returns target", wb, sheet, header_row, layout.returns,
-                                f"{key}_ret", optional=True) if returns_needed else layout.returns
-    return SheetLayout(int(header_row), date, amount, returns)
+        returns = (column_picker(f"PDF '{returns_label}' goes to", wb, sheet, header_row, base.returns,
+                                 key_prefix, "returns", optional=True)
+                   if returns_label else ColumnRef())
+    return SheetLayout(header_row, date, amount, returns)
 
 
-def mapping_editor(prepared, full: bool) -> None:
-    """One form. ``full`` = Advanced (everything); otherwise only what needs attention."""
-    profile, report, wb = copy.deepcopy(prepared.profile), prepared.report, prepared.wb
-    k = (lambda name: f"adv_{name}") if full else (lambda name: name)   # unique widget keys
-    is_new = prepared.profile_source == pipeline.NEW
-    sheet_names = wb.sheets if wb else []
-    problem_groups = [s.group for s in prepared.plan.sheets
-                      if s.status in (plan_mod.UNMAPPED, plan_mod.AMBIGUOUS, plan_mod.SHEET_MISSING)]
-    problem_sheets = sorted({s.sheet for s in prepared.plan.sheets if s.status == plan_mod.COLUMN_PROBLEM})
-    show_fields = full or is_new or bool(prepared.field_issues)
-    show_template = full or is_new or not profile.sheet_template.amount.is_set
-    groups_to_show = report.groups if (full or is_new) else problem_groups
-    returns_needed = bool(profile.source.returns_field) or full
+def pattern_lines(profile: Profile, prepared) -> list:
+    """'DATE -> A / DATE' lines for the common pattern, as found on its template sheet."""
+    t, src = profile.sheet_template, profile.source
+    res = None
+    for sheet in [profile.template_sheet] + profile.mapped_sheets():
+        if prepared.wb.has_sheet(sheet):
+            res = resolve_layout(prepared.wb, sheet, t, bool(t.returns.is_set))
+            if res.ok:
+                break
 
-    with st.form(k("mapping")):
-        if show_fields:
-            st.markdown("**Report fields** — chosen by column label, validated by content")
-            cols = report.columns
-            samples = {c: next((r.values.get(c, "") for r in report.rows if r.values.get(c, "").strip()), "")
-                       for c in cols}
-            labels = {c: f"{c}  ·  {report.column_kind(c)}  ·  e.g. {samples[c] or '—'}" for c in cols}
-            f1, f2, f3, f4 = st.columns(4)
+    def show(ref: ColumnRef, letter):
+        return f"{letter} / {ref.header}" if letter else ref.describe()
+    lines = [f"DATE → {show(t.date, res and res.date)}",
+             f"{src.amount_field} → {show(t.amount, res and res.amount)}"]
+    if src.returns_field:
+        lines.append(f"{src.returns_field} → "
+                     + (show(t.returns, res and res.returns) if t.returns.is_set else "not written"))
+    return lines
 
-            def pick(slot, title, current, optional):
-                opts = ([""] if optional else []) + cols
-                idx = opts.index(current) if current in opts else (0 if optional else None)
-                return slot.selectbox(title, opts, index=idx, placeholder="Choose",
-                                      format_func=lambda c: labels.get(c, "— none —"), key=k(f"fld_{title}"))
-            date_f = pick(f1, "Date", profile.source.date_field, False)
-            amount_f = pick(f2, "Main amount", profile.source.amount_field, False)
-            returns_f = pick(f3, "Returns (optional)", profile.source.returns_field, True)
-            ref_f = pick(f4, "Reference (audit only)", profile.source.reference_field, True)
-            name = st.text_input("Profile name", value=profile.profile_name, key=k("name")) if is_new else profile.profile_name
 
-        if groups_to_show:
-            st.markdown("**Customer → worksheet** (remembered; names are matched ignoring case, "
-                        "punctuation and spacing)")
-            choices = {}
-            grid = st.columns(3)
-            opts = ["", "(ignore this customer)"] + sheet_names
-            for i, group in enumerate(groups_to_show):
-                match = profiles.lookup_group(profile, group)
-                current = "(ignore this customer)" if match.status == "ignored" else match.sheet
-                choices[group] = grid[i % 3].selectbox(
-                    group, opts, index=opts.index(current) if current in opts else 0,
-                    format_func=lambda s: s or "— choose worksheet —", key=k(f"grp_{values.name_key(group)}"))
+# ===========================================================================
+# Mapping (normal view: summary + exceptions only)
+# ===========================================================================
 
-        template_sheet, template = None, profile.sheet_template
-        if show_template and wb:
-            st.markdown("**Worksheet columns** — one template used by every mapped worksheet "
-                        "whose headers match it")
-            mapped = [s for s in profile.mapped_sheets() if wb.has_sheet(s)]
-            sample_opts = mapped or sheet_names
-            template_sheet = st.selectbox("Template worksheet", sample_opts, key=k("tmpl_sheet"))
-            base = template if template.date.is_set else wb.suggest_layout(template_sheet)
-            base.amount, base.returns = template.amount, template.returns
-            template = layout_inputs(wb, template_sheet, base, k("tmpl"), returns_needed)
+def customer_editor(prepared, groups, key_prefix, title) -> None:
+    profile, sheets = prepared.profile, prepared.wb.sheets
+    with st.form(f"{key_prefix}_customers"):
+        st.markdown(title)
+        grid = st.columns(3)
+        options = ["", IGNORE] + sheets
+        choices = {}
+        for i, group in enumerate(groups):
+            match = profiles.lookup_group(profile, group)
+            current = IGNORE if match.status == "ignored" else match.sheet
+            choices[group] = grid[i % 3].selectbox(
+                group, options, index=options.index(current) if current in options else 0,
+                format_func=lambda s: s or "— choose worksheet —",
+                key=f"{key_prefix}_cust_{values.name_key(group)}")
+        if st.form_submit_button("Save customer mapping", type="primary"):
+            updated = copy.deepcopy(profile)
+            for group, sheet in choices.items():
+                if sheet == IGNORE:
+                    profiles.ignore_group(updated, group)
+                elif sheet:
+                    profiles.remember_group(updated, group, sheet)
+            save(updated, "Customer mapping saved.")
 
-        overrides = {}
-        override_sheets = sorted(set(problem_sheets) | (set(profile.sheet_overrides) if full else set()))
-        if full:
-            override_sheets = sorted(set(override_sheets) | set(profile.mapped_sheets()))
-        override_sheets = [s for s in override_sheets if wb and wb.has_sheet(s)]
-        if override_sheets:
-            st.markdown("**Worksheet overrides** — for sheets whose columns differ from the template")
-            for sheet in override_sheets:
-                own = sheet in profile.sheet_overrides
-                label = f"{sheet} — {'override' if own else 'uses template'}"
-                if sheet in problem_sheets:
-                    note = next(s.note for s in prepared.plan.sheets if s.sheet == sheet)
-                    label = f"{sheet} — needs attention: {note}"
-                with st.expander(label, expanded=sheet in problem_sheets):
-                    use_own = st.checkbox("Use its own columns (override)", value=own or sheet in problem_sheets,
-                                          key=k(f"ovr_on_{sheet}"))
-                    layout = layout_inputs(wb, sheet, profile.layout_for(sheet), k(f"ovr_{sheet}"), returns_needed)
-                    if use_own:
-                        overrides[sheet] = layout
 
-        submitted = st.form_submit_button("Save mapping", type="primary")
+def fields_editor(prepared, key_prefix) -> None:
+    """Report fields: which printed column is the date / amount / returns."""
+    report, profile = prepared.report, prepared.profile
+    cols = report.columns
+    sample = {c: next((r.values.get(c, "") for r in report.rows if r.values.get(c, "").strip()), "") for c in cols}
+    label = {c: f"{c} · {report.column_kind(c)} · e.g. {sample[c] or '—'}" for c in cols}
+    with st.form(f"{key_prefix}_fields"):
+        f1, f2, f3, f4 = st.columns(4)
 
-    if not submitted:
+        def pick(slot, title, current, optional):
+            opts = ([""] if optional else []) + cols
+            idx = opts.index(current) if current in opts else (0 if optional else None)
+            return slot.selectbox(title, opts, index=idx, placeholder="Choose",
+                                  format_func=lambda c: label.get(c, "— none —"), key=f"{key_prefix}_fld_{title}")
+        date_f = pick(f1, "Date", profile.source.date_field, False)
+        amount_f = pick(f2, "Main amount", profile.source.amount_field, False)
+        returns_f = pick(f3, "Returns (optional)", profile.source.returns_field, True)
+        ref_f = pick(f4, "Reference (audit only)", profile.source.reference_field, True)
+        if st.form_submit_button("Save report fields"):
+            if not date_f or not amount_f:
+                st.error("Choose the date and main amount fields.")
+                return
+            updated = copy.deepcopy(profile)
+            s = updated.source
+            s.date_field, s.amount_field, s.returns_field, s.reference_field = date_f, amount_f, returns_f or "", ref_f or ""
+            s.columns, s.group_label, s.group_total_label = list(cols), report.group_label, report.group_total_label
+            save(updated, "Report fields saved.")
+
+
+def pattern_setup(prepared, key_prefix, allow_all_sheets=False) -> None:
+    """Choose the common worksheet pattern.  NOT inside a form: changing the
+    worksheet immediately reloads that worksheet's headers."""
+    profile, wb = prepared.profile, prepared.wb
+    mapped = [s for s in profile.mapped_sheets() if wb.has_sheet(s)]
+    candidates = mapped + ([s for s in wb.sheets if s not in mapped] if allow_all_sheets else [])
+    if not candidates:
+        st.info("Map customers to worksheets first; the worksheet pattern is taken from a mapped worksheet.")
         return
-    if show_fields:
-        if not date_f or not amount_f:
-            st.error("Choose the date and main amount fields.")
+    suggestion = prepared.pattern
+    preferred = (profile.template_sheet if profile.template_sheet in candidates
+                 else suggestion.template_sheet if suggestion and suggestion.template_sheet in candidates
+                 else candidates[0])
+    sheet = st.selectbox("Take the pattern from worksheet", candidates, index=candidates.index(preferred),
+                         key=f"{key_prefix}_pattern_sheet")
+    if profile.sheet_template.amount.is_set:
+        base = copy.deepcopy(profile.sheet_template)
+    elif suggestion and sheet == suggestion.template_sheet:
+        base = copy.deepcopy(suggestion.layout)
+    else:
+        base = wb.suggest_layout(sheet)
+    layout = layout_editor(wb, sheet, base, f"{key_prefix}_pattern",
+                           profile.source.amount_field, profile.source.returns_field)
+    if st.button("Save worksheet pattern", type="primary", key=f"{key_prefix}_pattern_save"):
+        if not layout.date.is_set or not layout.amount.is_set:
+            st.error("Choose the DATE column and the column the main amount goes to.")
             return
-        profile.profile_name = (name or "New profile").strip()
-        profile.source.date_field, profile.source.amount_field = date_f, amount_f
-        profile.source.returns_field, profile.source.reference_field = returns_f or "", ref_f or ""
-        profile.source.columns = list(report.columns)
-        profile.source.group_label = report.group_label
-        profile.source.group_total_label = report.group_total_label
-    if groups_to_show:
-        for group, sheet in choices.items():
-            if sheet == "(ignore this customer)":
-                profiles.ignore_group(profile, group)
-            elif sheet:
-                profiles.remember_group(profile, group, sheet)
-    if show_template and template_sheet:
-        if not template.date.is_set or not template.amount.is_set:
-            st.error("Choose the DATE column and the main amount target column.")
+        updated = copy.deepcopy(profile)
+        updated.sheet_template, updated.template_sheet = layout, sheet
+        save(updated, f"Worksheet pattern saved from {sheet}.")
+
+
+def exception_editor(prepared, sheet, key_prefix, note="") -> None:
+    """Own columns for one worksheet whose layout differs from the pattern."""
+    profile, wb = prepared.profile, prepared.wb
+    if note:
+        st.caption(f"Why: {note}")
+    base = copy.deepcopy(profile.layout_for(sheet))
+    layout = layout_editor(wb, sheet, base, f"{key_prefix}_exc",
+                           profile.source.amount_field, profile.source.returns_field)
+    c1, c2 = st.columns(2)
+    if c1.button(f"Save for {sheet}", type="primary", key=f"{key_prefix}_exc_{sheet}_save"):
+        if not layout.date.is_set or not layout.amount.is_set:
+            st.error("Choose the DATE column and the column the main amount goes to.")
             return
-        profile.sheet_template = template
-    for sheet in override_sheets:
-        if sheet in overrides:
-            profile.sheet_overrides[sheet] = overrides[sheet]
-        else:
-            profile.sheet_overrides.pop(sheet, None)
-    saved(profile, "Mapping saved.")
+        updated = copy.deepcopy(profile)
+        updated.sheet_overrides[sheet] = layout
+        save(updated, f"{sheet} saved as an exception.")
+    if sheet in profile.sheet_overrides and c2.button(f"Use the common pattern for {sheet}",
+                                                      key=f"{key_prefix}_exc_{sheet}_drop"):
+        updated = copy.deepcopy(profile)
+        updated.sheet_overrides.pop(sheet, None)
+        save(updated, f"{sheet} now follows the common pattern.")
+
+
+def mapping_section(prepared) -> None:
+    profile, plan = prepared.profile, prepared.plan
+    st.markdown("#### Mapping")
+
+    if prepared.field_issues:
+        st.error("The report's fields need attention: " + " ".join(prepared.field_issues.values()))
+        fields_editor(prepared, "fix")
+        return
+
+    # Customer -> Worksheet
+    if plan.sheets:
+        st.markdown("**Customer → Worksheet**")
+        st.dataframe(pd.DataFrame([{
+            prepared.report.group_label or "Customer": s.group,
+            "Worksheet": s.sheet or "—",
+            "Dates found": f"{s.dates_matched}/{s.dates_total}" if s.sheet else "",
+            "Writes to": s.target or "—",
+            "Status": s.status + (" (exception)" if s.via == "exception" else ""),
+        } for s in plan.sheets]), width="stretch", hide_index=True)
+    unmapped = [s.group for s in plan.sheets if s.status in GROUP_PROBLEMS]
+    if unmapped:
+        everything = len(unmapped) == len(plan.sheets)
+        customer_editor(prepared, prepared.report.groups if everything else unmapped, "fix",
+                        "**Map customers to worksheets** (saved; names match ignoring case, "
+                        "punctuation and spacing)" if everything else
+                        f"**Needs attention — {len(unmapped)} customer(s) without a worksheet**")
+
+    # Common worksheet pattern
+    st.markdown("**Worksheet pattern**")
+    if profile.sheet_template.amount.is_set:
+        mapped = [s for s in profile.mapped_sheets() if prepared.wb.has_sheet(s)]
+        applied = {s.sheet for s in plan.sheets if s.via == "pattern" and s.status != plan_mod.COLUMN_PROBLEM}
+        st.markdown("  \n".join(pattern_lines(profile, prepared)))
+        st.caption(f"Applied automatically to "
+                   f"{len(applied)} of {len(mapped)} mapped worksheets"
+                   + (f" · {len(profile.sheet_overrides)} exception(s)" if profile.sheet_overrides else ""))
+    else:
+        s = prepared.pattern
+        if s:
+            found = [f"DATE → {s.layout.date.letter} / {s.layout.date.header}"]
+            if s.layout.returns.is_set:
+                found.append(f"{profile.source.returns_field} → {s.layout.returns.letter} / {s.layout.returns.header}")
+            st.info("Detected on worksheet **" + s.template_sheet + "**: " + " · ".join(found)
+                    + f". Choose once where the PDF's **{profile.source.amount_field}** goes; "
+                      "the pattern is then applied to every mapped worksheet with the same headers.")
+        pattern_setup(prepared, "fix")
+
+    # Exceptions: only the worksheets whose headers differ
+    if profile.sheet_template.amount.is_set:
+        problems = {}
+        for s in plan.sheets:
+            if s.status == plan_mod.COLUMN_PROBLEM and s.sheet:
+                problems.setdefault(s.sheet, s.note)
+        if problems:
+            st.markdown(f"**Needs attention — {len(problems)} worksheet(s) laid out differently**")
+            for sheet, note in problems.items():
+                with st.expander(f"{sheet}: {note}", expanded=len(problems) <= 3):
+                    exception_editor(prepared, sheet, "fix")
+
+
+def advanced_mapping(prepared) -> None:
+    profile, wb = prepared.profile, prepared.wb
+    st.markdown("**Report fields**")
+    fields_editor(prepared, "adv")
+    customer_editor(prepared, prepared.report.groups, "adv", "**All customers → worksheet**")
+    st.markdown("**Common worksheet pattern**")
+    pattern_setup(prepared, "adv", allow_all_sheets=True)
+    st.markdown("**Worksheet exceptions**")
+    mapped = [s for s in profile.mapped_sheets() if wb.has_sheet(s)]
+    if mapped:
+        sheet = st.selectbox("Worksheet", mapped, key="adv_exc_sheet",
+                             format_func=lambda s: f"{s} — {'exception' if s in profile.sheet_overrides else 'common pattern'}")
+        exception_editor(prepared, sheet, "adv")
 
 
 def settings_editor(profile: Profile) -> None:
@@ -284,7 +386,7 @@ def settings_editor(profile: Profile) -> None:
             profile.write.output_mode, profile.write.existing_values = output, existing
             profile.write.write_returns, profile.write.zero_fill_returns = write_returns, zero_fill
             profile.source.date_order = order
-            saved(profile, "Settings saved.")
+            save(profile, "Settings saved.")
 
 
 # ===========================================================================
@@ -323,7 +425,7 @@ if prepared.profile_source == pipeline.LOADED:
 elif prepared.profile_source == pipeline.GIVEN:
     st.info(f"Using profile **{prepared.profile.profile_name}**.")
 else:
-    st.warning("No saved mapping matches this report yet. Confirm it once below — it is then remembered.")
+    st.warning("No saved mapping for this report yet. Set it up once below — it is then remembered.")
 
 rep, recon = prepared.report, prepared.reconciliation
 period = f"{values.format_date(rep.period[0])} – {values.format_date(rep.period[1])}" \
@@ -339,22 +441,11 @@ m[4].metric("Cells ready", prepared.ready_count)
 for warning in prepared.document.warnings + rep.warnings + (recon.warnings if recon else []):
     st.warning(warning)
 for problem in prepared.hard_blockers:
-    st.error(problem)
+    if not prepared.field_issues or problem not in prepared.field_issues.values():
+        st.error(problem)
 
-needs_attention = (prepared.profile_source == pipeline.NEW or prepared.field_issues
-                   or any(s.status in (plan_mod.UNMAPPED, plan_mod.AMBIGUOUS, plan_mod.SHEET_MISSING,
-                                       plan_mod.COLUMN_PROBLEM) for s in prepared.plan.sheets))
-if needs_attention and prepared.wb:
-    st.markdown("#### Needs attention")
-    mapping_editor(prepared, full=False)
-
-if prepared.plan.sheets:
-    st.markdown("#### Mapping")
-    st.dataframe(pd.DataFrame([{
-        rep.group_label or "Group": s.group, "Worksheet": s.sheet,
-        "Date matches": f"{s.dates_matched}/{s.dates_total}", "Target": s.target,
-        "Status": s.status, "Note": s.note,
-    } for s in prepared.plan.sheets]), use_container_width=True, hide_index=True)
+if prepared.wb:
+    mapping_section(prepared)
 
 if prepared.plan.rows:
     st.markdown("#### What will be written")
@@ -369,22 +460,22 @@ if prepared.plan.rows:
         "Worksheet": x["worksheet"], "Cell": x["cell"], "Existing": x["existing_value"],
         "New value": x["new_value"], "Status": x["status"],
     } for x in audit.plan_rows(rows)])
-    st.dataframe(table, use_container_width=True, hide_index=True, height=420)
+    st.dataframe(table, width="stretch", hide_index=True, height=420)
 
-with st.expander("Advanced settings and diagnostics"):
-    tabs = st.tabs(["Mapping", "Write settings", "Reconciliation", "Rejected lines", "Exports"])
+with st.expander("Advanced mapping, settings and diagnostics"):
+    tabs = st.tabs(["Advanced mapping", "Write settings", "Reconciliation", "Rejected lines", "Exports"])
     with tabs[0]:
         if prepared.wb:
-            mapping_editor(prepared, full=True)
+            advanced_mapping(prepared)
     with tabs[1]:
         settings_editor(copy.deepcopy(prepared.profile))
     with tabs[2]:
-        st.dataframe(pd.DataFrame(audit.reconciliation_rows(recon)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(audit.reconciliation_rows(recon)), width="stretch", hide_index=True)
     with tabs[3]:
         st.caption("Lines that are not invoices (titles, headers, page footers, printed totals).")
         st.dataframe(pd.DataFrame([{"Page": r.page, "Line": r.text, "Reason": r.reason}
                                    for r in rep.ignored + prepared.rejected]),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
         st.caption(f"Extraction: {prepared.document.engine}. Columns: " + ", ".join(
             f"{c} ({rep.column_kind(c)})" for c in rep.columns))
     with tabs[4]:
@@ -412,7 +503,7 @@ elif not ready:
 else:
     exclude = False
     if blocked:
-        st.warning(f"{len(blocked)} cells cannot be written (see statuses above).")
+        st.warning(f"{len(blocked)} cells cannot be written yet (see Needs attention above).")
         exclude = st.checkbox(f"Leave those {len(blocked)} cells out and update the other {len(ready)}")
     sheets = sorted({r.sheet for r in ready})
     confirm = st.checkbox(
